@@ -1,0 +1,206 @@
+{
+  "users": {
+    "person_1": {
+      "id": "person_1",
+      "slot": 1,
+      "name": "Kaelen Thorne",
+      "username": "kaelen",
+      "passwordHash": "$2b$10$VWTBXSIV/1A3dGmxtbwdae2SXedgU3SUIt.m6S0Qi1Rd5/xNxXc.C",
+      "logo": {
+        "id": "astral_crest",
+        "name": "Astral Crest",
+        "accentColor": "#6366f1",
+        "glowColor": "rgba(99, 102, 241, 0.5)",
+        "svgPath": "M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"
+      },
+      "pfpUrl": "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80",
+      "nickname": "Kael",
+      "bio": "Guardian of the Northern Star",
+      "isLocked": false,
+      "allowedMinutes": 60,
+      "dailyUsageSeconds": 0,
+      "sessionStartTimestamp": 1789208419360,
+      "lastActiveTimestamp": 1789208986851
+    },
+    "person_2": {
+      "id": "person_2",
+      "slot": 2,
+      "name": "Seraphina Vance",
+      "username": "seraphina",
+      "passwordHash": "$2b$10$VWTBXSIV/1A3dGmxtbwdae2SXedgU3SUIt.m6S0Qi1Rd5/xNxXc.C",
+      "logo": {
+        "id": "lunar_chrono",
+        "name": "Lunar Chrono",
+        "accentColor": "#ec4899",
+        "glowColor": "rgba(236, 72, 153, 0.5)",
+        "svgPath": "M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
+      },
+      "pfpUrl": "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=400&auto=format&fit=crop&q=80",
+      "nickname": "Sera",
+      "bio": "Keeper of the Celestial Loom",
+      "isLocked": false,
+      "allowedMinutes": 60,
+      "dailyUsageSeconds": 0,
+      "sessionStartTimestamp": 1789208600332,
+      "lastActiveTimestamp": 1789208600332
+    }
+  },
+  "admin": {
+    "username": "admin",
+    "passwordHash": "$2b$10$VWTBXSIV/1A3dGmxtbwdaex7wkNGhK.O3/ihxXfx6c9Q/uTNG6.HS"
+  },
+  "settings": {
+    "worldTitle": "SYNAX",
+    "worldSubtitle": "Where Two Worlds Meet.",
+    "welcomeMessage": "Welcome to your private sanctuary. Every conversation, voice note, and shared moment here belongs solely to you both.",
+    "theme": "celestial",
+    "chatWallpaper": "stars",
+    "accentColor": "#6366f1",
+    "introDurationSeconds": 7,
+    "timeOverMessage": "Your time in SYNAX has ended for now. See you again soon ✨",
+    "timeStrategy": "continuous",
+    "warningMinutes": [
+      10,
+      5,
+      1
+    ],
+    "restrictionsOnExpire": {
+      "disableMessaging": true,
+      "disableVoiceCalls": true,
+      "disableVideoCalls": true,
+      "disableImages": true,
+      "disableFiles": true,
+      "disableVoiceMessages": true,
+      "lockSession": false
+    },
+    "featuresEnabled": {
+      "messages": true,
+      "reactions": true,
+      "imageSharing": true,
+      "fileSharing": true,
+      "voiceMessages": true,
+      "voiceCalls": true,
+      "videoCalls": true,
+      "editing": true,
+      "deleting": true
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_init_sys",
+      "senderId": "system",
+      "type": "system",
+      "text": "✦ The Synax sanctuary has been initialized. A sacred digital world for two.",
+      "timestamp": 1789203709156,
+      "status": "read",
+      "reactions": {}
+    },
+    {
+      "id": "msg_init_1",
+      "senderId": "person_1",
+      "type": "text",
+      "text": "Hey Sera! I configured our private sanctuary. No algorithms, no noise, just our universe.",
+      "timestamp": 1789204309156,
+      "status": "read",
+      "reactions": {
+        "person_2": "✨"
+      }
+    },
+    {
+      "id": "msg_init_2",
+      "senderId": "person_2",
+      "type": "text",
+      "text": "Kael, this is stunning! The opening marks and atmosphere are breathtaking. Let us guard this sanctuary.",
+      "timestamp": 1789204809156,
+      "status": "read",
+      "reactions": {
+        "person_1": "❤️"
+      }
+    },
+    {
+      "id": "msg_1789208437181_pdqug",
+      "senderId": "person_1",
+      "type": "text",
+      "text": "hii",
+      "timestamp": 1789208437181,
+      "status": "sent",
+      "reactions": {}
+    }
+  ],
+  "sessions": {
+    "synax_person_1_1789208419360_pap2dl0epo": {
+      "token": "synax_person_1_1789208419360_pap2dl0epo",
+      "userId": "person_1",
+      "sessionStart": 1789208419360,
+      "lastActive": 1789208437181,
+      "allowedSeconds": 3600,
+      "isExpired": false
+    },
+    "synax_person_1_1789208534689_dejzkw0mki": {
+      "token": "synax_person_1_1789208534689_dejzkw0mki",
+      "userId": "person_1",
+      "sessionStart": 1789208419360,
+      "lastActive": 1789208534896,
+      "allowedSeconds": 3600,
+      "isExpired": false
+    },
+    "synax_person_2_1789208600332_rcwwzbv19m": {
+      "token": "synax_person_2_1789208600332_rcwwzbv19m",
+      "userId": "person_2",
+      "sessionStart": 1789208600332,
+      "lastActive": 1789208600332,
+      "allowedSeconds": 3600,
+      "isExpired": false
+    },
+    "synax_person_1_1789208986851_8bjra40bfi": {
+      "token": "synax_person_1_1789208986851_8bjra40bfi",
+      "userId": "person_1",
+      "sessionStart": 1789208419360,
+      "lastActive": 1789208986852,
+      "allowedSeconds": 3600,
+      "isExpired": false
+    }
+  },
+  "logs": [
+    {
+      "id": "log_1789208986852_apyv",
+      "timestamp": 1789208986852,
+      "actor": "person_1",
+      "action": "User Logged In",
+      "details": "Session started: Kaelen Thorne entered the sanctuary",
+      "level": "info"
+    },
+    {
+      "id": "log_1789208600333_hoy8",
+      "timestamp": 1789208600333,
+      "actor": "person_2",
+      "action": "User Logged In",
+      "details": "Session started: Seraphina Vance entered the sanctuary",
+      "level": "info"
+    },
+    {
+      "id": "log_1789208534689_3gk1",
+      "timestamp": 1789208534689,
+      "actor": "person_1",
+      "action": "User Logged In",
+      "details": "Session started: Kaelen Thorne entered the sanctuary",
+      "level": "info"
+    },
+    {
+      "id": "log_1789208419361_yzas",
+      "timestamp": 1789208419361,
+      "actor": "person_1",
+      "action": "User Logged In",
+      "details": "Session started: Kaelen Thorne entered the sanctuary",
+      "level": "info"
+    },
+    {
+      "id": "log_init",
+      "timestamp": 1789207309156,
+      "actor": "System",
+      "action": "Synax Core Initialized",
+      "details": "Initial configuration and user marks loaded",
+      "level": "info"
+    }
+  ]
+}
