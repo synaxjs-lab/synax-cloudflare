@@ -1,0 +1,348 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-serif-anime: 'Shippori Mincho', 'Cinzel', 'Cormorant Garamond', serif;
+    --font-serif-cinematic: 'Cinzel', 'Shippori Mincho', 'Cormorant Garamond', serif;
+    --font-sans-celestial: 'Plus Jakarta Sans', 'Outfit', sans-serif;
+  }
+
+  body {
+    font-family: var(--font-sans-celestial);
+    letter-spacing: 0.015em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1, h2, h3, .font-cinzel, .font-cinematic {
+    font-family: var(--font-serif-cinematic);
+  }
+}
+
+/* Custom Anime Cinematic Typography Utilities */
+@layer utilities {
+  .font-shippori {
+    font-family: 'Shippori Mincho', 'Cinzel', serif;
+  }
+
+  .font-cinzel {
+    font-family: 'Cinzel', 'Shippori Mincho', serif;
+  }
+
+  .font-cormorant {
+    font-family: 'Cormorant Garamond', serif;
+  }
+
+  .font-sans-celestial {
+    font-family: 'Plus Jakarta Sans', 'Outfit', sans-serif;
+  }
+
+  /* Cinematic Letter Spacing */
+  .tracking-anime-title {
+    letter-spacing: 0.28em;
+  }
+
+  .tracking-anime-tagline {
+    letter-spacing: 0.38em;
+  }
+
+  .tracking-anime-header {
+    letter-spacing: 0.22em;
+  }
+
+  .tracking-anime-pill {
+    letter-spacing: 0.3em;
+  }
+
+  .tracking-anime-wide {
+    letter-spacing: 0.45em;
+  }
+
+  /* Subtle, Ethereal Text Shadows (Twilight & Starlight Anime Aesthetic) */
+  .text-shadow-cinematic {
+    text-shadow: 0 0 25px rgba(129, 140, 248, 0.45), 0 0 50px rgba(99, 102, 241, 0.25), 0 2px 8px rgba(0, 0, 0, 0.9);
+  }
+
+  .text-shadow-anime-glow {
+    text-shadow: 0 0 16px rgba(224, 231, 255, 0.65), 0 0 32px rgba(129, 140, 248, 0.4), 0 1px 4px rgba(0, 0, 0, 0.95);
+  }
+
+  .text-shadow-anime-rose {
+    text-shadow: 0 0 16px rgba(253, 232, 243, 0.65), 0 0 32px rgba(244, 114, 182, 0.4), 0 1px 4px rgba(0, 0, 0, 0.95);
+  }
+
+  .text-shadow-starlight {
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.6), 0 0 22px rgba(165, 180, 252, 0.35);
+  }
+
+  .text-shadow-subtle {
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8), 0 0 12px rgba(129, 140, 248, 0.2);
+  }
+
+  .text-shadow-dark {
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.9), 0 0 20px rgba(0, 0, 0, 0.8);
+  }
+}
+
+
+/* SYNAX performance baseline */
+html, body, #root {
+  min-height: 100%;
+  width: 100%;
+}
+
+html {
+  background: #03050a;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  overflow-x: hidden;
+}
+
+@media (max-width: 640px) {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Keep mobile rendering cheap. The visual design stays the same, but large
+     shadow/blur layers are reduced where they hurt low-end phones most. */
+  .backdrop-blur-2xl {
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+  }
+
+  .backdrop-blur-xl {
+    backdrop-filter: blur(4px) !important;
+    -webkit-backdrop-filter: blur(4px) !important;
+  }
+
+  .shadow-2xl {
+    box-shadow: 0 6px 24px rgba(0,0,0,.32) !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+.synax-message-row {
+  /* Keep message rendering lightweight without allowing containment to
+     interfere with the parent chat scroll container. */
+  content-visibility: auto;
+  contain: style;
+  contain-intrinsic-size: 96px;
+}
+
+
+
+/* Mobile chat controls are intentionally larger and labeled instead of
+   shrinking desktop controls into tiny icon-only buttons. */
+.synax-mobile-action {
+  min-width: 74px;
+  min-height: 44px;
+  padding: 6px 10px;
+  border-radius: 14px;
+  border: 1px solid rgba(51,65,85,.9);
+  background: rgba(15,23,42,.92);
+  color: rgba(226,232,240,.9);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 2px;
+  flex: 0 0 auto;
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 600;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.synax-mobile-action:active {
+  transform: translateY(1px);
+}
+
+@media (max-width: 640px) {
+  html, body, #root {
+    width: 100%;
+    min-width: 0;
+  }
+
+  body {
+    font-size: 14px;
+    overscroll-behavior: none;
+  }
+
+  button, input, textarea, select {
+    font-size: 16px;
+  }
+
+  .synax-mobile-action svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .synax-mobile-action {
+    min-height: 48px;
+  }
+
+  .synax-chat-scroll-area {
+    scrollbar-gutter: stable;
+  }
+
+  .synax-message-row {
+    contain: style;
+  }
+
+  /* Backdrop blur is expensive during mobile scrolling on lower-powered
+     devices. Keep the same visual surfaces without forcing GPU-heavy blur. */
+  .synax-message-row .backdrop-blur-xl,
+  .synax-message-row .backdrop-blur-2xl {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
+/* SYNAX mobile action sheet + measured chat viewport */
+.synax-chat-scroll-area {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: auto;
+  max-height: 100dvh;
+  min-height: 0;
+  touch-action: pan-y;
+  pointer-events: auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scroll-padding-top: var(--synax-header-height, 150px);
+  scroll-padding-bottom: calc(var(--synax-composer-height, 92px) + 16px);
+  scrollbar-width: thin;
+  scrollbar-gutter: stable;
+  will-change: scroll-position;
+}
+
+@media (max-width: 767px) {
+  .synax-chat-scroll-area {
+    touch-action: pan-y;
+    pointer-events: auto;
+  }
+
+  .synax-mobile-action {
+    min-height: 50px;
+  }
+}
+
+
+/* Final SYNAX header layout: identity stays compact on every viewport. */
+#synax-chat-room header {
+  min-height: 0;
+}
+
+@media (max-width: 767px) {
+  #synax-chat-room header {
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+}
+
+
+/* Lightweight realtime chat motion: never animate the full message row. */
+.synax-typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 18px;
+}
+
+.synax-typing-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: .45;
+  animation: synax-typing-bounce 1.15s ease-in-out infinite;
+}
+
+.synax-typing-dot:nth-child(2) { animation-delay: 140ms; }
+.synax-typing-dot:nth-child(3) { animation-delay: 280ms; }
+
+@keyframes synax-typing-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: .38; }
+  30% { transform: translateY(-2px); opacity: .95; }
+}
+
+.synax-typing-bubble {
+  animation: synax-typing-pop 180ms ease-out both;
+}
+
+@keyframes synax-typing-pop {
+  from { opacity: 0; transform: translateY(4px) scale(.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.synax-message-bubble-enter {
+  animation: synax-message-bubble-enter 120ms cubic-bezier(.22,.8,.22,1) both;
+}
+
+@keyframes synax-message-bubble-enter {
+  from { opacity: 0.82; transform: translate3d(0, 4px, 0) scale(.99); }
+  to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+
+.synax-reaction-burst {
+  left: 50%;
+  top: 50%;
+  font-size: 28px;
+  line-height: 1;
+  transform: translate(-50%, -50%);
+  animation: synax-reaction-burst 420ms cubic-bezier(.2,.85,.25,1) both;
+  will-change: transform, opacity;
+  filter: drop-shadow(0 4px 14px rgba(0,0,0,.35));
+}
+
+@keyframes synax-reaction-burst {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(.55) rotate(-8deg); }
+  35% { opacity: 1; transform: translate(-50%, -58%) scale(1.15) rotate(4deg); }
+  100% { opacity: 0; transform: translate(-50%, -82%) scale(.9) rotate(0deg); }
+}
+
+.synax-reaction-picker {
+  animation: synax-reaction-picker-in 110ms cubic-bezier(.22,.8,.22,1) both;
+  transform-origin: center bottom;
+}
+
+@keyframes synax-reaction-picker-in {
+  from { opacity: 0; transform: translate3d(0, 4px, 0) scale(.96); }
+  to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+
+.synax-send-pop {
+  animation: synax-send-pop 130ms cubic-bezier(.22,.8,.22,1);
+}
+
+@keyframes synax-send-pop {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.09); }
+  100% { transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .synax-message-bubble-enter,
+  .synax-reaction-burst,
+  .synax-reaction-picker,
+  .synax-send-pop,
+  .synax-typing-bubble,
+  .synax-typing-dot {
+    animation: none !important;
+  }
+}

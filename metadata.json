@@ -1,0 +1,6 @@
+{
+  "name": "Synax",
+  "description": "A secret digital space that exists only for two best friends. Where two worlds meet.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
