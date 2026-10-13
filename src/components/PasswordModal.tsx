@@ -118,7 +118,7 @@ export const PasswordModal: React.FC<PasswordModalProps> = ({
                 <span>Enter your private key</span>
               </span>
               <span className="text-[10px] text-slate-500 font-mono">
-                Default: synax123
+                Enter your PS
               </span>
             </label>
 
