@@ -479,6 +479,7 @@ function chatMessageToRow(message: any, clientMessageId?: string | null): Supaba
 
 async function loadMessagesFromSupabase(): Promise<any[]> {
   const pending = await loadPendingMessagesFromRealtime();
+<<<<<<< HEAD
   if (messagesTableAvailable === false) {
     return mergePendingMessages(db.messages || [], pending);
   }
@@ -487,6 +488,28 @@ async function loadMessagesFromSupabase(): Promise<any[]> {
       `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&order=timestamp.asc&limit=5000`
     );
     const rows = await res.json() as SupabaseMessageRow[];
+=======
+  try {
+    // Do not trust the per-isolate negative table cache for chat history. A
+    // previous request may have hit a stale PostgREST schema cache; if we
+    // short-circuit here, this isolate can serve stale in-memory history for
+    // its entire lifetime even after the table becomes available.
+    // PostgREST may cap rows per response, so page through the newest canonical
+    // history in bounded batches instead of asking for 5,000 rows in one call.
+    const pageSize = 1000;
+    const maxHistoryRows = 5000;
+    const rows: SupabaseMessageRow[] = [];
+    for (let offset = 0; offset < maxHistoryRows; offset += pageSize) {
+      const res = await supabaseFetch(
+        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&order=timestamp.asc,id.asc&limit=${pageSize}&offset=${offset}`
+      );
+      const page = await res.json() as SupabaseMessageRow[];
+      if (!Array.isArray(page)) throw new Error('Supabase returned an invalid message history response.');
+      rows.push(...page);
+      if (page.length < pageSize) break;
+    }
+
+>>>>>>> 9fc5fdf (Update SYNAX project)
     messagesTableAvailable = true;
     let messages = rows.map(rowToChatMessage);
     if (messages.length === 0 && Array.isArray(db?.messages) && db.messages.length > 0) {
@@ -499,12 +522,19 @@ async function loadMessagesFromSupabase(): Promise<any[]> {
       messagesTableAvailable = false;
       return mergePendingMessages(db.messages || [], pending);
     }
+<<<<<<< HEAD
     // Pending messages are still safe to display while Supabase is temporarily
     // unavailable. Preserve them instead of making a refresh erase a message.
     if (pending.length) {
       console.warn('SYNAX message history temporarily unavailable; serving durable pending messages:', error);
       return mergePendingMessages(db.messages || [], pending);
     }
+=======
+    // Do not silently replace canonical history with a stale isolate snapshot
+    // on transient auth/network/API failures. Surface a 503 so logs show the
+    // real cause and the client can retain its current messages on screen.
+    console.error('SYNAX canonical message history fetch failed:', error);
+>>>>>>> 9fc5fdf (Update SYNAX project)
     throw error;
   }
 }
