@@ -417,10 +417,13 @@ export const ApiService = {
 
   async logout(): Promise<void> {
     const token = ApiService.getToken();
+    // Remove browser-persisted credentials immediately. The captured token is
+    // still used below to invalidate the server-side session when the network
+    // is available, but a refresh cannot restore the expired local session.
+    ApiService.setToken(null);
     if (token) {
       try { await apiFetch('/api/auth/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }); } catch {}
     }
-    ApiService.setToken(null);
   },
 
   async adminLogout(): Promise<void> {
