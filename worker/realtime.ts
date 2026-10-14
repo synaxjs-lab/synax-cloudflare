@@ -115,6 +115,94 @@ async function loadSession(env: Env, token: string): Promise<ClientInfo | null> 
   };
 }
 
+class RealtimeMessagePolicyError extends Error {
+  constructor(public readonly code: 'TIME_EXPIRED' | 'MESSAGING_DISABLED' | 'TIME_STATUS_UNAVAILABLE', message: string) {
+    super(message);
+    this.name = 'RealtimeMessagePolicyError';
+  }
+}
+
+/**
+ * Enforce message expiry on the authenticated WebSocket path as well as HTTP.
+ * WebSocket chat sends bypass /api/messages, so relying on its Express
+ * middleware alone allows a logged-in socket to keep sending after expiry.
+ * Use the same persisted state and usage row as server.cloudflare.ts.
+ */
+async function assertRealtimeMessagingAllowed(env: Env, userId: UserId): Promise<void> {
+  let appState: any;
+  let usage: any;
+  try {
+    const [stateResponse, usageResponse] = await Promise.all([
+      supabaseFetch(env, '/rest/v1/synax_state?id=eq.main&select=state&limit=1'),
+      supabaseFetch(
+        env,
+        `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}` +
+        '&select=user_id,daily_used_seconds,continuous_used_seconds,active,active_started_at,last_heartbeat&limit=1',
+      ),
+    ]);
+    const stateRows = await stateResponse.json() as Array<{ state: any }>;
+    const usageRows = await usageResponse.json() as any[];
+    appState = stateRows[0]?.state;
+    usage = usageRows[0];
+  } catch (error) {
+    console.error('SYNAX realtime message time check failed:', error);
+    throw new RealtimeMessagePolicyError(
+      'TIME_STATUS_UNAVAILABLE',
+      'Unable to verify your remaining SYNAX time. Please try again shortly.',
+    );
+  }
+
+  if (!appState || !appState.users?.[userId] || !usage) {
+    // Fail closed: never let a connected socket bypass the expiry policy just
+    // because the authoritative state could not be read.
+    throw new RealtimeMessagePolicyError(
+      'TIME_STATUS_UNAVAILABLE',
+      'Unable to verify your remaining SYNAX time. Please try again shortly.',
+    );
+  }
+
+  if (appState.settings?.featuresEnabled?.messages === false) {
+    throw new RealtimeMessagePolicyError('MESSAGING_DISABLED', 'Messaging is temporarily disabled by Admin.');
+  }
+
+  // Keep the admin-configurable expiration policy. If the field is absent in
+  // older saved state, default to blocking (the safe/default SYNAX behavior).
+  const disableMessagingOnExpire = appState.settings?.restrictionsOnExpire?.disableMessaging !== false;
+  if (!disableMessagingOnExpire) return;
+
+  const allowedMinutes = Number(appState.users[userId].allowedMinutes ?? 60);
+  if (!Number.isFinite(allowedMinutes)) {
+    throw new RealtimeMessagePolicyError(
+      'TIME_STATUS_UNAVAILABLE',
+      'Unable to verify your remaining SYNAX time. Please try again shortly.',
+    );
+  }
+  // SYNAX treats a non-positive allowance as no configured limit.
+  if (allowedMinutes <= 0) return;
+
+  const now = Date.now();
+  const settings = appState.settings || {};
+  const isDaily = settings.dailyResetAtMidnight === true || settings.timeStrategy === 'daily';
+  const allowedSeconds = allowedMinutes * 60;
+  let usedSeconds = Number(isDaily ? usage.daily_used_seconds : usage.continuous_used_seconds) || 0;
+
+  if (usage.active && usage.active_started_at != null) {
+    const activeStartedAt = normalizeTimestamp(usage.active_started_at);
+    const lastHeartbeat = normalizeTimestamp(usage.last_heartbeat) || activeStartedAt;
+    const graceMs = isDaily ? 15000 : 8000;
+    const effectiveEnd = Math.min(now, lastHeartbeat + graceMs);
+    usedSeconds += Math.max(0, Math.floor((effectiveEnd - activeStartedAt) / 1000));
+  }
+
+  const remainingSeconds = Math.max(0, allowedSeconds - usedSeconds);
+  if (remainingSeconds <= 0) {
+    throw new RealtimeMessagePolicyError(
+      'TIME_EXPIRED',
+      String(settings.timeOverMessage || 'Your SYNAX communication time has expired.'),
+    );
+  }
+}
+
 export class SynaxRealtimeHub extends DurableObject<Env> {
   private async getLastSeen(userId: UserId): Promise<number> {
     const cached = normalizeTimestamp((await this.ctx.storage.get<number>(`lastSeen:${userId}`)) || 0);
@@ -862,6 +950,9 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       const message = data.message;
       if (!message || !isUserId(message.senderId) || message.senderId !== info.userId) return;
       try {
+        // Important: authenticated sockets can outlive their timer. Recheck the
+        // authoritative Supabase allowance for every outgoing realtime message.
+        await assertRealtimeMessagingAllowed(this.env, info.userId);
         const result = await this.enqueueMessage({
           ...message,
           timestamp: Number(message.timestamp) > 0 ? Number(message.timestamp) : Date.now(),
@@ -876,10 +967,12 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
           }));
         } catch {}
       } catch (error) {
+        const policyError = error instanceof RealtimeMessagePolicyError ? error : null;
         try {
           ws.send(JSON.stringify({
             type: 'chat:message_error',
             clientMessageId: message.clientMessageId,
+            code: policyError?.code || 'MESSAGE_FAILED',
             error: error instanceof Error ? error.message : 'Realtime message failed.',
           }));
         } catch {}
