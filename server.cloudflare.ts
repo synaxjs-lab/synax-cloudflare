@@ -278,6 +278,7 @@ const useSupabase = true;
 
 let db: DbSchema;
 let persistenceQueue: Promise<void> = Promise.resolve();
+let lastPersistenceError: unknown = null;
 let lastRemoteSync = 0;
 let stateRefreshInFlight: Promise<void> | null = null;
 const STATE_REFRESH_TTL_MS = 10000;
@@ -479,26 +480,14 @@ function chatMessageToRow(message: any, clientMessageId?: string | null): Supaba
 
 async function loadMessagesFromSupabase(): Promise<any[]> {
   const pending = await loadPendingMessagesFromRealtime();
+  if (messagesTableAvailable === false) {
+    return mergePendingMessages(db.messages || [], pending);
+  }
   try {
-    // Do not trust the per-isolate negative table cache for chat history. A
-    // previous request may have hit a stale PostgREST schema cache; if we
-    // short-circuit here, this isolate can serve stale in-memory history for
-    // its entire lifetime even after the table becomes available.
-    // PostgREST may cap rows per response, so page through the newest canonical
-    // history in bounded batches instead of asking for 5,000 rows in one call.
-    const pageSize = 1000;
-    const maxHistoryRows = 5000;
-    const rows: SupabaseMessageRow[] = [];
-    for (let offset = 0; offset < maxHistoryRows; offset += pageSize) {
-      const res = await supabaseFetch(
-        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&order=timestamp.asc,id.asc&limit=${pageSize}&offset=${offset}`
-      );
-      const page = await res.json() as SupabaseMessageRow[];
-      if (!Array.isArray(page)) throw new Error('Supabase returned an invalid message history response.');
-      rows.push(...page);
-      if (page.length < pageSize) break;
-    }
-
+    const res = await supabaseFetch(
+      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&order=timestamp.asc&limit=5000`
+    );
+    const rows = await res.json() as SupabaseMessageRow[];
     messagesTableAvailable = true;
     let messages = rows.map(rowToChatMessage);
     if (messages.length === 0 && Array.isArray(db?.messages) && db.messages.length > 0) {
@@ -511,10 +500,12 @@ async function loadMessagesFromSupabase(): Promise<any[]> {
       messagesTableAvailable = false;
       return mergePendingMessages(db.messages || [], pending);
     }
-    // Do not silently replace canonical history with a stale isolate snapshot
-    // on transient auth/network/API failures. Surface a 503 so logs show the
-    // real cause and the client can retain its current messages on screen.
-    console.error('SYNAX canonical message history fetch failed:', error);
+    // Pending messages are still safe to display while Supabase is temporarily
+    // unavailable. Preserve them instead of making a refresh erase a message.
+    if (pending.length) {
+      console.warn('SYNAX message history temporarily unavailable; serving durable pending messages:', error);
+      return mergePendingMessages(db.messages || [], pending);
+    }
     throw error;
   }
 }
@@ -1419,10 +1410,19 @@ async function refreshDbFromSupabase(force = false) {
 
 function saveDbSync(): Promise<void> {
   const snapshot = cloneDb(db);
-  persistenceQueue = persistenceQueue
+  // Keep the queue usable after a failed write, but remember the last failure
+  // so mutation endpoints can avoid reporting a false success to the Admin UI.
+  const writeAttempt = persistenceQueue
     .catch(() => undefined)
-    .then(() => persistToSupabase(snapshot))
-    .catch((err) => console.error('Failed to persist SYNAX state:', err));
+    .then(() => persistToSupabase(snapshot));
+
+  persistenceQueue = writeAttempt.then(
+    () => { lastPersistenceError = null; },
+    (err) => {
+      lastPersistenceError = err;
+      console.error('Failed to persist SYNAX state:', err);
+    },
+  );
 
   // Cloudflare may finish the HTTP response before a detached promise finishes.
   cloudflareExecutionContext?.waitUntil?.(persistenceQueue);
@@ -1431,6 +1431,12 @@ function saveDbSync(): Promise<void> {
 
 async function flushPersistence() {
   await persistenceQueue;
+  if (lastPersistenceError) {
+    const detail = lastPersistenceError instanceof Error
+      ? lastPersistenceError.message
+      : String(lastPersistenceError);
+    throw new Error(`SYNAX data persistence failed: ${detail.slice(0, 600)}`);
+  }
 }
 
 function addLog(actor: string, action: string, details?: string, level: 'info' | 'warn' | 'alert' = 'info') {
@@ -3000,7 +3006,7 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Update Identities & Passwords
-  app.put('/api/admin/users', requireAdminAuth, (req: Request, res: Response) => {
+  app.put('/api/admin/users', requireAdminAuth, async (req: Request, res: Response) => {
     const { person_1, person_2 } = req.body;
 
     if (person_1) {
@@ -3027,6 +3033,7 @@ export async function createCloudflareHttpServer() {
 
     saveDbSync();
     addLog('Admin', 'Updated Person Identities / Credentials', 'Names, logos or limits modified');
+    await flushPersistence();
 
     broadcast({
       type: 'identities:updated',
@@ -3046,7 +3053,7 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Lock / Unlock User
-  app.post('/api/admin/user/:id/lock', requireAdminAuth, (req: Request, res: Response) => {
+  app.post('/api/admin/user/:id/lock', requireAdminAuth, async (req: Request, res: Response) => {
     const userId = req.params.id as 'person_1' | 'person_2';
     const { isLocked, lockReason } = req.body;
 
@@ -3060,6 +3067,7 @@ export async function createCloudflareHttpServer() {
 
     saveDbSync();
     addLog('Admin', isLocked ? `Locked ${db.users[userId].name}` : `Unlocked ${db.users[userId].name}`, lockReason, isLocked ? 'alert' : 'info');
+    await flushPersistence();
 
     broadcast({
       type: 'user:lock_state',
@@ -3151,6 +3159,7 @@ export async function createCloudflareHttpServer() {
       `${action} for ${user.name}`,
       `Reset usage: ${!!resetSession}; Added: ${addMinutes || 0}m`
     );
+    await flushPersistence();
 
     // Immediately push the updated authoritative timer to connected devices.
     broadcast({
@@ -3185,29 +3194,41 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Update App & Communication Settings
-  app.put('/api/admin/settings', requireAdminAuth, (req: Request, res: Response) => {
+  app.put('/api/admin/settings', requireAdminAuth, async (req: Request, res: Response) => {
     const newSettings = req.body;
+    if (!newSettings || typeof newSettings !== 'object' || Array.isArray(newSettings)) {
+      res.status(400).json({ error: 'Invalid settings payload. Send a JSON object.' });
+      return;
+    }
+    if (!db?.settings || !db.settings.restrictionsOnExpire || !db.settings.featuresEnabled) {
+      throw new Error('Admin settings state is not initialized correctly.');
+    }
+
     db.settings = {
       ...db.settings,
       ...newSettings,
       restrictionsOnExpire: {
         ...db.settings.restrictionsOnExpire,
-        ...(newSettings.restrictionsOnExpire || {})
+        ...(newSettings.restrictionsOnExpire && typeof newSettings.restrictionsOnExpire === 'object'
+          ? newSettings.restrictionsOnExpire : {})
       },
       featuresEnabled: {
         ...db.settings.featuresEnabled,
-        ...(newSettings.featuresEnabled || {})
+        ...(newSettings.featuresEnabled && typeof newSettings.featuresEnabled === 'object'
+          ? newSettings.featuresEnabled : {})
       }
     };
 
     saveDbSync();
     addLog('Admin', 'Settings Updated', 'Appearance, time rules or communication features updated');
+    await flushPersistence();
 
     broadcast({
       type: 'settings:updated',
       settings: db.settings
     });
 
+    res.setHeader('Cache-Control', 'no-store');
     res.json({ success: true, settings: db.settings });
   });
 
@@ -3254,6 +3275,7 @@ export async function createCloudflareHttpServer() {
     for (const s of currentAdminSessions) {
       try { await saveSessionToSupabase(s as any); } catch (err) { console.error('Failed to preserve admin session:', err); }
     }
+    await flushPersistence();
     broadcast({ type: 'settings:updated', settings: db.settings });
     broadcast({ type: 'identities:updated', person_1: db.users.person_1, person_2: db.users.person_2 });
     broadcast({ type: 'chat:history_cleared' });
@@ -3278,11 +3300,16 @@ export async function createCloudflareHttpServer() {
       await clearMessagesInSupabase([freshSystemMessage]);
       db.messages = [freshSystemMessage];
       addLog('Admin', 'Chat History Cleared', 'All previous messages purged');
+      await flushPersistence();
       broadcast({ type: 'chat:history_cleared' });
       res.json({ success: true });
     } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err || 'Unknown chat storage error');
       console.error('Failed to clear messages:', err);
-      res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
+      res.status(503).json({
+        error: 'Chat storage temporarily unavailable.',
+        detail: detail.slice(0, 600),
+      });
     }
   });
 
@@ -3292,7 +3319,7 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Change Administrator Password
-  app.post('/api/admin/change-password', requireAdminAuth, (req: Request, res: Response) => {
+  app.post('/api/admin/change-password', requireAdminAuth, async (req: Request, res: Response) => {
     const { currentPassword, newPassword } = req.body;
     if (!newPassword || typeof newPassword !== 'string' || newPassword.trim().length < 4) {
       res.status(400).json({ error: 'New password must be at least 4 characters long.' });
@@ -3307,6 +3334,7 @@ export async function createCloudflareHttpServer() {
     db.admin.passwordHash = bcrypt.hashSync(newPassword.trim(), 10);
     saveDbSync();
     addLog('Admin', 'Password Changed', 'Master administrator password successfully updated');
+    await flushPersistence();
     res.json({ success: true });
   });
 
@@ -3314,7 +3342,7 @@ export async function createCloudflareHttpServer() {
   // client expects JSON from /api/*; returning HTML causes errors such as
   // "Unexpected token '<'" when the client calls response.json().
   app.use((err: any, req: Request, res: Response, next: NextFunction) => {
-    console.error('SYNAX API unhandled error:', err);
+    console.error(`SYNAX API unhandled error [${req.method} ${req.originalUrl}]:`, err);
     if (req.path === '/api' || req.path.startsWith('/api/')) {
       if (res.headersSent) return next(err);
       const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
