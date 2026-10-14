@@ -35,6 +35,17 @@ function apiErrorFromResponse(data: any, status: number): string {
   return `Request failed (HTTP ${status}).`;
 }
 
+/** Parse every API response consistently and preserve backend diagnostics.
+ * Some server errors intentionally return both a generic `error` and a more
+ * useful `detail`; never discard that detail in the admin panel.
+ */
+async function readApiResponse<T = any>(res: Response): Promise<T> {
+  const data = await readApiJson<any>(res);
+  if (!res.ok) throw new Error(apiErrorFromResponse(data, res.status));
+  if (data?.__nonJson) throw new Error(apiErrorFromResponse(data, res.status));
+  return (data ?? {}) as T;
+}
+
 let authToken: string | null = null;
 let adminAuthToken: string | null = null;
 
@@ -823,9 +834,12 @@ export const ApiService = {
     const token = ApiService.getAdminToken();
     const res = await apiFetch('/api/admin/overview', {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
-    if (!res.ok) throw new Error('Failed to load admin users');
-    const data = await res.json();
+    const data = await readApiResponse<any>(res);
+    if (!data?.users?.person_1 || !data?.users?.person_2) {
+      throw new Error('Admin overview response is missing user data.');
+    }
     return [data.users.person_1, data.users.person_2];
   },
 
@@ -833,9 +847,10 @@ export const ApiService = {
     const token = ApiService.getAdminToken();
     const res = await apiFetch('/api/admin/overview', {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
-    if (!res.ok) throw new Error('Failed to load admin settings');
-    const data = await res.json();
+    const data = await readApiResponse<any>(res);
+    if (!data?.settings) throw new Error('Admin overview response is missing settings.');
     return data.settings;
   },
 
@@ -843,26 +858,37 @@ export const ApiService = {
     const token = ApiService.getAdminToken();
     const res = await apiFetch('/api/admin/logs', {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data.logs || [];
+    // Audit logs are supplementary: let the rest of the admin portal open if
+    // the log endpoint alone is temporarily unavailable, but preserve details.
+    try {
+      const data = await readApiResponse<any>(res);
+      return Array.isArray(data.logs) ? data.logs : [];
+    } catch (error) {
+      console.error('SYNAX admin audit-log request failed:', error);
+      return [];
+    }
   },
 
   async adminGetMessages(): Promise<ChatMessage[]> {
     const token = ApiService.getAdminToken();
-    const res = await apiFetch('/api/admin/messages', { headers: { Authorization: `Bearer ${token}` } });
-    if (!res.ok) throw new Error('Failed to load admin messages');
-    const data = await res.json();
-    return data.messages || [];
+    const res = await apiFetch('/api/admin/messages', {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
+    });
+    const data = await readApiResponse<any>(res);
+    return Array.isArray(data.messages) ? data.messages : [];
   },
 
   async adminGetSessions(): Promise<any[]> {
     const token = ApiService.getAdminToken();
-    const res = await apiFetch('/api/admin/sessions', { headers: { Authorization: `Bearer ${token}` } });
-    if (!res.ok) throw new Error('Failed to load admin sessions');
-    const data = await res.json();
-    return data.sessions || [];
+    const res = await apiFetch('/api/admin/sessions', {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
+    });
+    const data = await readApiResponse<any>(res);
+    return Array.isArray(data.sessions) ? data.sessions : [];
   },
 
   async adminUpdateSettings(settings: Partial<AppSettings>): Promise<AppSettings> {
@@ -874,9 +900,10 @@ export const ApiService = {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(settings),
+      cache: 'no-store',
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to update settings');
+    const data = await readApiResponse<any>(res);
+    if (!data.settings) throw new Error('Settings update response did not include saved settings.');
     return data.settings;
   },
 
@@ -892,25 +919,22 @@ export const ApiService = {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(payload),
+      cache: 'no-store',
     });
-    const resData = await res.json().catch(() => ({}));
+    const resData = await readApiResponse<any>(res);
 
-    if (!res.ok) {
-      throw new Error(
-        resData.error || resData.message || 'Failed to update user'
-      );
-    }
-
-    // If locked status changed
+    // Keep the lock request separate, but don't silently ignore its response.
     if (data.isLocked !== undefined) {
-      await apiFetch(`/api/admin/user/${userId}/lock`, {
+      const lockRes = await apiFetch(`/api/admin/user/${userId}/lock`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ isLocked: data.isLocked, lockReason: data.lockReason }),
+        cache: 'no-store',
       });
+      await readApiResponse<any>(lockRes);
     }
 
     return resData;
@@ -928,13 +952,10 @@ export const ApiService = {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(options),
+      cache: 'no-store',
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(
-        data.error || data.message || 'Failed to adjust user time'
-      );
-    }
+    const data = await readApiResponse<any>(res);
+    if (!data.timeStatus) throw new Error('Time adjustment response did not include the updated timer.');
     return data.timeStatus;
   },
 
@@ -942,35 +963,25 @@ export const ApiService = {
     userId: 'person_1' | 'person_2',
     minutes: number
   ): Promise<TimeStatus> {
-    return ApiService.adminAdjustUserTime(userId, {
-      setMinutes: minutes,
-    });
+    return ApiService.adminAdjustUserTime(userId, { setMinutes: minutes });
   },
 
   async adminAddTime(
     userId: 'person_1' | 'person_2',
     minutes: number
   ): Promise<TimeStatus> {
-    return ApiService.adminAdjustUserTime(userId, {
-      addMinutes: minutes,
-    });
+    return ApiService.adminAdjustUserTime(userId, { addMinutes: minutes });
   },
 
   async adminRemoveTime(
     userId: 'person_1' | 'person_2',
     minutes: number
   ): Promise<TimeStatus> {
-    return ApiService.adminAdjustUserTime(userId, {
-      addMinutes: -Math.abs(minutes),
-    });
+    return ApiService.adminAdjustUserTime(userId, { addMinutes: -Math.abs(minutes) });
   },
 
-  async adminResetUserUsage(
-    userId: 'person_1' | 'person_2'
-  ): Promise<TimeStatus> {
-    return ApiService.adminAdjustUserTime(userId, {
-      resetSession: true,
-    });
+  async adminResetUserUsage(userId: 'person_1' | 'person_2'): Promise<TimeStatus> {
+    return ApiService.adminAdjustUserTime(userId, { resetSession: true });
   },
 
   async adminGrantExtraTime(minutes: number): Promise<TimeStatus> {
@@ -990,8 +1001,9 @@ export const ApiService = {
     const res = await apiFetch('/api/admin/messages/clear', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
-    return res.json();
+    return readApiResponse<any>(res);
   },
 
   async adminUpdatePassword(currentPassword: string, newPassword: string) {
@@ -1003,10 +1015,9 @@ export const ApiService = {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({ currentPassword, newPassword }),
+      cache: 'no-store',
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to update administrator password');
-    return data;
+    return readApiResponse<any>(res);
   },
 
   async adminResetDefaults() {
@@ -1014,9 +1025,8 @@ export const ApiService = {
     const res = await apiFetch('/api/admin/reset-defaults', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || data.message || 'Factory reset failed');
-    return data;
+    return readApiResponse<any>(res);
   },
 };
