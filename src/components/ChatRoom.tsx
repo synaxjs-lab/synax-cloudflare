@@ -376,11 +376,38 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   const [isBackgroundPickerOpen, setIsBackgroundPickerOpen] = useState(false);
   const [isBackgroundUploading, setIsBackgroundUploading] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [timerExpiredLocally, setTimerExpiredLocally] = useState(Boolean(timeStatus?.isExpired));
   const [sharedBackground, setSharedBackground] = useState<SharedChatBackground>(() => ({
     ...DEFAULT_SHARED_BACKGROUND,
     backgroundValue: settings.chatWallpaper || 'stars',
   }));
 
+  // The timer pill has its own local countdown, but messaging must follow that
+  // same countdown instead of waiting up to 10 seconds for the next API poll.
+  const isTimeExpiredAtCurrentClock = useCallback(() => {
+    if (!timeStatus) return false;
+    if (timeStatus.isExpired) return true;
+    if (!timeStatus.hasLimit) return false;
+    const now = ServerClock.now();
+    const serverTimestamp = Number(timeStatus.serverTimestamp || now);
+    const elapsedSeconds = Math.max(0, Math.floor((now - serverTimestamp) / 1000));
+    const remaining = Math.max(0, Number(timeStatus.remainingSeconds || 0) - elapsedSeconds);
+    return remaining <= 0;
+  }, [timeStatus]);
+
+  useEffect(() => {
+    const reconcileLocalDeadline = () => {
+      const expired = isTimeExpiredAtCurrentClock();
+      setTimerExpiredLocally((previous) => previous === expired ? previous : expired);
+    };
+    reconcileLocalDeadline();
+    const timer = window.setInterval(reconcileLocalDeadline, 250);
+    return () => window.clearInterval(timer);
+  }, [isTimeExpiredAtCurrentClock]);
+
+  const shouldBlockMessagingForExpiredTime =
+    settings.restrictionsOnExpire?.disableMessaging !== false &&
+    (Boolean(timeStatus?.isExpired) || timerExpiredLocally);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
@@ -1016,6 +1043,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   // Message Send Handlers
   const handleSendMessage = async (payload: any) => {
+    if (settings.restrictionsOnExpire?.disableMessaging !== false && isTimeExpiredAtCurrentClock()) {
+      setTimerExpiredLocally(true);
+      throw new Error(settings.timeOverMessage || 'Your SYNAX communication time has expired.');
+    }
+
     const clientMessageId = payload.clientMessageId || `client_${currentUser.id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const reply = replyingTo
       ? {
@@ -1714,7 +1746,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           onSendMessage={handleSendMessage}
           onTyping={handleTyping}
           onUpload={handleUpload}
-          isExpired={timeStatus?.isExpired}
+          isExpired={shouldBlockMessagingForExpiredTime}
           settings={settings}
           replyingTo={replyingTo}
           onCancelReply={() => setReplyingTo(null)}
