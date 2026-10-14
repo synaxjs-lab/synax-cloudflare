@@ -82,7 +82,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onExit }) => {
   const fetchAllData = async () => {
     try {
       setIsLoading(true);
-      const [usersData, settingsData, timeData, auditData, msgData, sessData] = await Promise.all([
+      // Keep the result order aligned with the five requests below. The old
+      // code destructured six values from five promises, shifting audit,
+      // message and session data into the wrong state variables.
+      const [usersData, settingsData, auditData, msgData, sessData] = await Promise.all([
         ApiService.adminGetUsers(),
         ApiService.adminGetSettings(),
         ApiService.adminGetAuditLogs(),
@@ -97,7 +100,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onExit }) => {
       setActiveSessions(sessData);
     } catch (err: any) {
       console.error('Failed to load admin data:', err);
-      setErrorMsg('Failed to sync admin state. Please ensure you are authenticated.');
+      setErrorMsg(`Failed to sync admin state: ${err?.message || 'Unknown API error'}`);
     } finally {
       setIsLoading(false);
     }
