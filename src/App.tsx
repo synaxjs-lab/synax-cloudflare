@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AnimatePresence } from 'motion/react';
 import { CosmicBackground } from './components/CosmicBackground';
 import { CinematicIntro } from './components/CinematicIntro';
@@ -38,6 +38,8 @@ export default function App() {
   const [timeStatus, setTimeStatus] = useState<TimeStatus | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [initError, setInitError] = useState<string | null>(null);
+  // Prevent multiple automatic logout calls when the timer has reached zero.
+  const expiryLogoutRef = useRef<string | null>(null);
 
   // Modals
   const [showAdminLogin, setShowAdminLogin] = useState(false);
@@ -133,9 +135,22 @@ export default function App() {
         // Never resurrect used time during the same day. Only a higher revision,
         // an explicit allowance change, or the scheduled midnight date change can
         // increase the remaining allowance.
-        if (sameDay && !limitChanged && (incomingIsStale ||
+        if (sameDay && !limitChanged && !incoming.isExpired && (incomingIsStale ||
             (incomingVersion === previousVersion && incoming.remainingSeconds > previous.remainingSeconds))) {
-          return { ...incoming, remainingSeconds: previous.remainingSeconds, usageVersion: previousVersion };
+          // Keep an older allowance revision from restoring used time, but carry
+          // the previous allowance forward to the current server timestamp. Without
+          // subtracting elapsed time here, periodic stale ticks can push expiry out.
+          const previousTimestamp = Number(previous.serverTimestamp || 0);
+          const elapsedSeconds = previousTimestamp > 0
+            ? Math.max(0, (ServerClock.now() - previousTimestamp) / 1000)
+            : 0;
+          const preservedRemaining = Math.max(0, Number(previous.remainingSeconds || 0) - elapsedSeconds);
+          return {
+            ...incoming,
+            remainingSeconds: preservedRemaining,
+            isExpired: Boolean(previous.isExpired || preservedRemaining <= 0),
+            usageVersion: previousVersion,
+          };
         }
         return incoming;
       });
@@ -295,13 +310,68 @@ export default function App() {
     setViewState('chat');
   };
 
-  const handleLogout = async () => {
-    await ApiService.logout();
+  const handleLogout = useCallback(async () => {
+    // Start server-side invalidation, then immediately clear the local session
+    // and disconnect realtime. Expiry should not leave the chat visible while
+    // a network logout request is in flight.
+    const logoutRequest = ApiService.logout();
     socketService.disconnect();
     setCurrentUser(null);
     setSelectedUserId(null);
+    setTimeStatus(null);
+    setMessages([]);
+    setActiveCall(null);
     setViewState('select');
-  };
+    await logoutRequest;
+  }, []);
+
+  // When the admin's "Lock session when time reaches zero" rule is enabled,
+  // automatically log this specific person out as soon as their server-clock
+  // deadline is reached. This remains active even if their WebSocket ticks stop.
+  useEffect(() => {
+    const userId = currentUser?.id;
+    const shouldLockOnExpiry = settings?.restrictionsOnExpire?.lockSession === true;
+    if (viewState !== 'chat' || !userId || !timeStatus || !shouldLockOnExpiry || timeStatus.hasLimit === false) {
+      if (viewState !== 'chat' || !userId || !shouldLockOnExpiry || timeStatus?.hasLimit === false) {
+        expiryLogoutRef.current = null;
+      }
+      return;
+    }
+
+    const snapshotServerTime = Number(timeStatus.serverTimestamp || 0);
+    if (snapshotServerTime > 0) ServerClock.sync(snapshotServerTime);
+    const snapshotRemaining = Math.max(0, Number(timeStatus.remainingSeconds || 0));
+    const deadline = snapshotServerTime > 0
+      ? snapshotServerTime + snapshotRemaining * 1000
+      : ServerClock.now() + snapshotRemaining * 1000;
+
+    const checkExpiry = () => {
+      if (expiryLogoutRef.current === userId) return;
+      if (timeStatus.isExpired || snapshotRemaining <= 0 || deadline <= ServerClock.now()) {
+        expiryLogoutRef.current = userId;
+        void handleLogout();
+      }
+    };
+
+    checkExpiry();
+    const interval = window.setInterval(checkExpiry, 250);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') checkExpiry();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [
+    viewState,
+    currentUser?.id,
+    settings?.restrictionsOnExpire?.lockSession,
+    timeStatus?.isExpired,
+    timeStatus?.remainingSeconds,
+    timeStatus?.serverTimestamp,
+    handleLogout,
+  ]);
 
   const handleStartCall = async (callType: 'voice' | 'video') => {
     const other = currentUser?.id === 'person_1' ? person2 : person1;
