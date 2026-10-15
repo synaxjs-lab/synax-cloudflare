@@ -290,7 +290,6 @@ const sessionCache = new Map<string, { session: DbSchema['sessions'][string]; ex
 // Keep the app functional in that situation and fall back to the canonical
 // synax_state document until the table is available.
 let sessionsTableAvailable: boolean | null = null;
-let messagesTableAvailable: boolean | null = null;
 let usageTableAvailable: boolean | null = null;
 let usageCheckpointRpcAvailable: boolean | null = null;
 
@@ -479,91 +478,104 @@ function chatMessageToRow(message: any, clientMessageId?: string | null): Supaba
 }
 
 async function loadMessagesFromSupabase(): Promise<any[]> {
+  // Durable Object storage holds only messages not yet persisted to Supabase.
+  // Supabase's synax_messages table is the canonical long-term message history.
   const pending = await loadPendingMessagesFromRealtime();
-  if (messagesTableAvailable === false) {
-    return mergePendingMessages(db.messages || [], pending);
-  }
   try {
-    const res = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&order=timestamp.asc&limit=5000`
-    );
-    const rows = await res.json() as SupabaseMessageRow[];
-    messagesTableAvailable = true;
-    let messages = rows.map(rowToChatMessage);
+    // Always re-check Supabase. Never let a cached "table unavailable" flag
+    // force this Worker isolate to return an outdated copy from synax_state.
+    // PostgREST may cap responses at 1,000 rows, so read several pages.
+    // Fetch newest-first so active conversations still load even if there are
+    // more than 5,000 rows, then sort them chronologically for the UI.
+    const pageSize = 1000;
+    const maxHistoryRows = 5000;
+    const rows: SupabaseMessageRow[] = [];
+
+    for (let offset = 0; offset < maxHistoryRows; offset += pageSize) {
+      const path =
+        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted` +
+        `&order=timestamp.desc,id.desc&limit=${pageSize}&offset=${offset}`;
+      const res = await supabaseFetch(path, { headers: { 'Cache-Control': 'no-cache' } });
+      const page = await res.json() as SupabaseMessageRow[];
+      if (!Array.isArray(page)) {
+        throw new Error('Supabase returned an invalid message history response.');
+      }
+      rows.push(...page);
+      if (page.length < pageSize) break;
+    }
+
+
+    // Deduplicate rows defensively before sorting. Concurrent inserts during
+    // offset pagination can otherwise cause a boundary row to repeat.
+    const unique = new Map<string, SupabaseMessageRow>();
+    for (const row of rows) {
+      const key = String(row.client_message_id || row.id || '');
+      if (key && !unique.has(key)) unique.set(key, row);
+    }
+    let messages = Array.from(unique.values())
+      .map(rowToChatMessage)
+      .sort((a: any, b: any) =>
+        Number(a.timestamp) - Number(b.timestamp) || String(a.id).localeCompare(String(b.id))
+      );
+
+    // Keep the existing one-time migration for a genuinely empty message table.
+    // If the database read failed, do not silently seed from stale memory.
     if (messages.length === 0 && Array.isArray(db?.messages) && db.messages.length > 0) {
-      // Seed lazily on the first history request instead of during startup.
       messages = await ensureMessagesTableSeed(db.messages);
     }
+
     return mergePendingMessages(messages, pending);
   } catch (error) {
     if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return mergePendingMessages(db.messages || [], pending);
+      // A SQL Editor result does not guarantee that PostgREST can see the table.
+      // Do not fall back to synax_state here: that snapshot is not authoritative
+      // and is exactly how newly saved messages can appear to vanish on refresh.
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Canonical chat history public.${SUPABASE_MESSAGES_TABLE} is not accessible through the Supabase Data API. ` +
+        `Verify public is exposed, service-role/secret-key access is configured, and reload the PostgREST schema cache. Details: ${detail}`
+      );
     }
-    // Pending messages are still safe to display while Supabase is temporarily
-    // unavailable. Preserve them instead of making a refresh erase a message.
-    if (pending.length) {
-      console.warn('SYNAX message history temporarily unavailable; serving durable pending messages:', error);
-      return mergePendingMessages(db.messages || [], pending);
-    }
+    console.error('SYNAX canonical message history fetch failed:', error);
     throw error;
   }
 }
+
 
 async function findMessageById(id: string): Promise<any | null> {
-  if (messagesTableAvailable === false) {
-    return (db.messages || []).find((message: any) => String(message.id) === String(id)) || null;
-  }
   try {
     const res = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`
+      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`,
+      { headers: { 'Cache-Control': 'no-cache' } },
     );
     const rows = await res.json() as SupabaseMessageRow[];
-    messagesTableAvailable = true;
     return rows[0] ? rowToChatMessage(rows[0]) : null;
   } catch (error) {
-    if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return (db.messages || []).find((message: any) => String(message.id) === String(id)) || null;
-    }
     throw error;
   }
 }
+
 
 async function findMessageByClientId(clientMessageId: string): Promise<any | null> {
-  if (messagesTableAvailable === false) {
-    return (db.messages || []).find((message: any) => String(message.clientMessageId || '') === String(clientMessageId)) || null;
-  }
   try {
     const res = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?client_message_id=eq.${encodeURIComponent(clientMessageId)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`
+      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?client_message_id=eq.${encodeURIComponent(clientMessageId)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`,
+      { headers: { 'Cache-Control': 'no-cache' } },
     );
     const rows = await res.json() as SupabaseMessageRow[];
-    messagesTableAvailable = true;
     return rows[0] ? rowToChatMessage(rows[0]) : null;
   } catch (error) {
-    if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return (db.messages || []).find((message: any) => String(message.clientMessageId || '') === String(clientMessageId)) || null;
-    }
     throw error;
   }
 }
 
-async function insertMessageToSupabase(message: any, clientMessageId?: string | null): Promise<any> {
-  if (messagesTableAvailable === false) {
-    const existing = clientMessageId ? await findMessageByClientId(String(clientMessageId)) : null;
-    if (existing) return existing;
-    const next = [...(db.messages || []), { ...message, clientMessageId: clientMessageId || message.clientMessageId }];
-    db.messages = next.slice(-5000);
-    await saveDbSync();
-    return message;
-  }
 
+async function insertMessageToSupabase(message: any, clientMessageId?: string | null): Promise<any> {
   const row = chatMessageToRow(message, clientMessageId);
   const useIdempotency = Boolean(clientMessageId);
-  // client_message_id deduplicates normal user messages; idempotency on the
-  // primary key also protects system/call messages and concurrent retries.
+  // Idempotency makes retries safe, but never report success until we can read
+  // the canonical row back. The state-document fallback is not safe for chat
+  // history because concurrent Worker isolates can overwrite it with stale data.
   const path = useIdempotency
     ? `/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=client_message_id`
     : `/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=id`;
@@ -575,75 +587,39 @@ async function insertMessageToSupabase(message: any, clientMessageId?: string | 
       },
       body: JSON.stringify(row),
     });
-    messagesTableAvailable = true;
     const rows = await res.json().catch(() => []);
     if (Array.isArray(rows) && rows[0]) return rowToChatMessage(rows[0]);
-    if (useIdempotency) {
-      const existing = await findMessageByClientId(String(clientMessageId));
-      if (existing) return existing;
-    } else {
-      const existing = await findMessageById(String(message.id));
-      if (existing) return existing;
-    }
-    return message;
-  } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    const existing = clientMessageId ? await findMessageByClientId(String(clientMessageId)) : null;
+
+    const existing = useIdempotency
+      ? await findMessageByClientId(String(clientMessageId))
+      : await findMessageById(String(message.id));
     if (existing) return existing;
-    db.messages = [...(db.messages || []), { ...message, clientMessageId: clientMessageId || message.clientMessageId }].slice(-5000);
-    await saveDbSync();
-    return message;
+    throw new Error('Supabase did not return or confirm the saved chat message.');
+  } catch (error) {
+    throw error;
   }
 }
 
+
 async function updateMessageInSupabase(id: string, patch: Record<string, unknown>): Promise<any | null> {
-  if (messagesTableAvailable === false) {
-    const index = (db.messages || []).findIndex((message: any) => String(message.id) === String(id));
-    if (index < 0) return null;
-    const updated = { ...db.messages[index], ...patch };
-    if ('file_url' in patch) updated.fileUrl = patch.file_url;
-    if ('is_pinned' in patch) updated.isPinned = patch.is_pinned;
-    if ('is_edited' in patch) updated.isEdited = patch.is_edited;
-    if ('deleted' in patch) updated.deleted = patch.deleted;
-    db.messages[index] = updated;
-    await saveDbSync();
-    return updated;
-  }
   try {
     const res = await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}`, {
       method: 'PATCH',
       headers: { Prefer: 'return=representation' },
       body: JSON.stringify(patch),
     });
-    messagesTableAvailable = true;
     const rows = await res.json().catch(() => []);
     return Array.isArray(rows) && rows[0] ? rowToChatMessage(rows[0]) : null;
   } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    return updateMessageInSupabase(id, patch);
+    throw error;
   }
 }
+
 
 async function markMessagesReadInSupabase(senderId: 'person_1' | 'person_2', messageIds?: string[]) {
   const safeIds = Array.isArray(messageIds)
     ? messageIds.filter((id) => /^[A-Za-z0-9._:-]{1,160}$/.test(String(id))).slice(0, 200)
     : [];
-
-  if (messagesTableAvailable === false) {
-    let count = 0;
-    db.messages = (db.messages || []).map((message: any) => {
-      const idMatches = !safeIds.length || safeIds.includes(String(message.id));
-      if (message.senderId === senderId && idMatches && message.status !== 'read') {
-        count += 1;
-        return { ...message, status: 'read' };
-      }
-      return message;
-    });
-    if (count) await saveDbSync();
-    return count;
-  }
   try {
     const idFilter = safeIds.length
       ? `&id=in.(${safeIds.map((id) => encodeURIComponent(String(id))).join(',')})`
@@ -656,28 +632,20 @@ async function markMessagesReadInSupabase(senderId: 'person_1' | 'person_2', mes
         body: JSON.stringify({ status: 'read' }),
       }
     );
-    messagesTableAvailable = true;
     const rows = await res.json().catch(() => []);
     return Array.isArray(rows) ? rows.length : 0;
   } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    return markMessagesReadInSupabase(senderId, messageIds);
+    throw error;
   }
 }
 
+
 async function clearMessagesInSupabase(seedMessages: any[]) {
-  if (messagesTableAvailable === false) {
-    db.messages = [...seedMessages];
-    await saveDbSync();
-    return;
-  }
   try {
     await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=not.is.null`, {
       method: 'DELETE',
       headers: { Prefer: 'return=minimal' },
     });
-    messagesTableAvailable = true;
     if (seedMessages.length) {
       await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}`, {
         method: 'POST',
@@ -686,28 +654,23 @@ async function clearMessagesInSupabase(seedMessages: any[]) {
       });
     }
   } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    db.messages = [...seedMessages];
-    await saveDbSync();
+    throw error;
   }
 }
 
+
 async function ensureMessagesTableSeed(seedMessages: any[]) {
-  if (messagesTableAvailable === false) return seedMessages;
   try {
     const probe = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id&limit=1`
+      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id&limit=1`,
+      { headers: { 'Cache-Control': 'no-cache' } },
     );
-    messagesTableAvailable = true;
     const existingRows = await probe.json().catch(() => []);
     if (Array.isArray(existingRows) && existingRows.length > 0) {
       return loadMessagesFromSupabase();
     }
     if (seedMessages.length > 0) {
-      // Worker isolates can start concurrently. Two isolates may both see an
-      // empty table and attempt to seed the same message IDs. Use PostgREST
-      // id-conflict resolution so initialization is fully idempotent.
+      // Concurrent isolates may seed at once; conflict-ignore makes this safe.
       await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=id`, {
         method: 'POST',
         headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
@@ -716,13 +679,10 @@ async function ensureMessagesTableSeed(seedMessages: any[]) {
     }
     return await loadMessagesFromSupabase();
   } catch (error) {
-    if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return seedMessages;
-    }
     throw error;
   }
 }
+
 
 type UserUsageRow = {
   user_id: 'person_1' | 'person_2';
@@ -2385,7 +2345,10 @@ export async function createCloudflareHttpServer() {
       res.json({ messages });
     } catch (err) {
       console.error('Failed to load messages:', err);
-      res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
+      res.status(503).json({
+        error: 'Chat storage temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -2597,14 +2560,6 @@ export async function createCloudflareHttpServer() {
   app.get('/api/messages/receipts', requireUserAuth, async (req: Request, res: Response) => {
     const userId = (req as any).userId as 'person_1' | 'person_2';
     try {
-      if (messagesTableAvailable === false) {
-        const rows = (db.messages || [])
-          .filter((message: any) => message.senderId === userId)
-          .slice(-100)
-          .map((message: any) => ({ id: String(message.id), status: message.status }));
-        res.json({ receipts: rows });
-        return;
-      }
       const response = await supabaseFetch(
         `/rest/v1/${SUPABASE_MESSAGES_TABLE}?sender_id=eq.${userId}&select=id,status&order=timestamp.desc&limit=100`
       );
@@ -2615,17 +2570,11 @@ export async function createCloudflareHttpServer() {
           : [],
       });
     } catch (err) {
-      if (isMissingDataApiTableError(err)) {
-        messagesTableAvailable = false;
-        const rows = (db.messages || [])
-          .filter((message: any) => message.senderId === userId)
-          .slice(-100)
-          .map((message: any) => ({ id: String(message.id), status: message.status }));
-        res.json({ receipts: rows });
-        return;
-      }
-      console.error('Failed to load message receipts:', err);
-      res.status(503).json({ error: 'Chat receipt service temporarily unavailable.' });
+        console.error('Failed to load message receipts:', err);
+      res.status(503).json({
+        error: 'Chat receipt service temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -3239,7 +3188,10 @@ export async function createCloudflareHttpServer() {
       res.json({ messages });
     } catch (err) {
       console.error('Failed to load admin messages:', err);
-      res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
+      res.status(503).json({
+        error: 'Chat storage temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
