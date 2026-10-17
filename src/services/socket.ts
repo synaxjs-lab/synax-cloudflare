@@ -255,7 +255,7 @@ class SocketService {
     });
   }
 
-  async sendChatMessage(message: any, timeoutMs = 1000): Promise<any | null> {
+  async sendChatMessage(message: any, timeoutMs = 5000): Promise<any | null> {
     const clientMessageId = String(message?.clientMessageId || '').trim();
     if (!clientMessageId) return null;
     if (!(await this.waitForRealtimeReady(450))) return null;
