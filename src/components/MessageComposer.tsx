@@ -373,10 +373,20 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({
     <div className="relative w-full bg-slate-950/80 border-t border-slate-800/80 px-3 sm:px-6 py-3 backdrop-blur-xl">
       {(isUploading || uploadError) && (
         <div className="mb-2 rounded-xl border border-slate-800 bg-slate-900/80 px-3 py-2" aria-live="polite">
-          <div className="flex items-center justify-between gap-3 text-[11px]">
-            <div className="min-w-0 flex items-center gap-2">
-              {isUploading && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-indigo-300" />}
-              <span className="truncate text-slate-300">{isUploading ? `Sending ${uploadBatchTotal > 1 ? `${uploadBatchIndex}/${uploadBatchTotal}: ` : ''}${uploadFileName || 'media'}…` : uploadError}</span>
+          <div className="flex items-start justify-between gap-3 text-[11px]">
+            <div className="min-w-0 flex-1 flex items-start gap-2">
+              {isUploading && <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-indigo-300" />}
+              {isUploading ? (
+                <span className="truncate text-slate-300">{`Sending ${uploadBatchTotal > 1 ? `${uploadBatchIndex}/${uploadBatchTotal}: ` : ''}${uploadFileName || 'media'}…`}</span>
+              ) : (
+                <div
+                  className="max-h-28 min-w-0 overflow-y-auto whitespace-pre-wrap break-words text-rose-200 leading-relaxed"
+                  role="alert"
+                  title={uploadError || undefined}
+                >
+                  {uploadError}
+                </div>
+              )}
             </div>
             {isUploading && <span className="shrink-0 font-mono tabular-nums font-semibold text-indigo-300">{Math.round(uploadProgress)}%</span>}
           </div>
