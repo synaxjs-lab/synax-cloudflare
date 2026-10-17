@@ -386,8 +386,11 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
         : '/rest/v1/synax_messages?on_conflict=id';
       await supabaseFetch(this.env, path, {
         method: 'POST',
-        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
         body: JSON.stringify(row),
+        // Bound the first attempt so a slow Supabase request cannot leave the
+        // WebSocket pending indefinitely. The durable queue remains for retry.
+        signal: AbortSignal.timeout(3500),
       });
       await this.ctx.storage.delete(this.pendingMessageKey(message));
       return true;
@@ -410,11 +413,6 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       }
       await this.persistMessageNow(message);
     }
-  }
-
-  private async persistEnqueuedMessage(message: any) {
-    const ok = await this.persistMessageNow(message);
-    if (!ok) await this.ensureMessageAlarm();
   }
 
   private async ensureMessageAlarm() {
@@ -450,7 +448,7 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
     }
   }
 
-  private async enqueueMessage(message: any): Promise<{ message: any; recipientOnline: boolean; delivered: boolean }> {
+  private async enqueueMessage(message: any): Promise<{ message: any; recipientOnline: boolean; delivered: boolean; persistedToSupabase: boolean; durability: 'supabase' | 'durable-pending-queue' }> {
     const senderId = message?.senderId as UserId;
     if (!isUserId(senderId)) throw new Error('Invalid message sender.');
     const recipientId = oppositeUser(senderId);
@@ -490,6 +488,14 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
     }
     await Promise.all(writes);
 
+    // The Durable Object write above is the first durable commit. Attempt the
+    // canonical Supabase write before acknowledging/broadcasting the message.
+    // If Supabase is temporarily unavailable, persistMessageNow deliberately
+    // leaves the queued row in Durable Object storage and schedules a retry;
+    // /pending-messages can then restore it after a refresh.
+    const persistedToSupabase = await this.persistMessageNow(canonical);
+    if (!persistedToSupabase) await this.ensureMessageAlarm();
+
     const serialized = JSON.stringify({
       type: 'chat:new_message',
       message: canonical,
@@ -498,12 +504,13 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       try { socket.send(serialized); } catch {}
     }
 
-    // Supabase is deliberately off the critical send path. The durable local
-    // queue guarantees the message can still be recovered after a refresh.
-    this.ctx.waitUntil(this.persistEnqueuedMessage(canonical));
-    if (!recipientOnline) await this.ensureMessageAlarm();
-
-    return { message: canonical, recipientOnline, delivered: recipientOnline };
+    return {
+      message: canonical,
+      recipientOnline,
+      delivered: recipientOnline,
+      persistedToSupabase,
+      durability: persistedToSupabase ? 'supabase' : 'durable-pending-queue',
+    };
   }
 
   private async ensurePresenceAlarm() {
@@ -571,6 +578,8 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
             recipientOnline: result.recipientOnline,
             delivered: result.delivered,
             message: result.message,
+            persistedToSupabase: result.persistedToSupabase,
+            durability: result.durability,
           });
         } catch (error) {
           return json({
