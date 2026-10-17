@@ -118,9 +118,7 @@ async function uploadResumableMedia(
     }),
     cache: 'no-store',
   });
-  // Preserve text/HTML error responses from Cloudflare or Storage instead of
-  // replacing them with an empty object; this makes upload failures diagnosable.
-  const prepareData = await readApiJson<any>(prepareResponse);
+  const prepareData = await prepareResponse.json().catch(() => ({}));
   if (!prepareResponse.ok) {
     throw new Error(apiErrorFromResponse(prepareData, prepareResponse.status));
   }
@@ -479,7 +477,11 @@ export const ApiService = {
       cache: 'no-store',
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to fetch messages');
+    if (!res.ok) {
+      const message = data.detail ? `${data.error || 'Failed to fetch messages'}: ${data.detail}` : (data.error || 'Failed to fetch messages');
+      throw new Error(message);
+    }
+    if (!Array.isArray(data.messages)) throw new Error('Message history API returned an invalid response.');
     return data.messages;
   },
 
