@@ -478,19 +478,29 @@ function chatMessageToRow(message: any, clientMessageId?: string | null): Supaba
 }
 
 async function loadMessagesFromSupabase(): Promise<any[]> {
-  // synax_messages is the canonical long-term history. Durable Object storage
-  // contains only messages that have not yet been committed to that table.
-  // Never substitute the in-memory synax_state snapshot for canonical history:
-  // every Worker isolate can hold a different, older snapshot.
-  const pending = await loadPendingMessagesFromRealtime();
-  const pageSize = 1000;
-  const maxHistoryRows = 5000;
-  const rows: SupabaseMessageRow[] = [];
-
+  // Supabase is the canonical long-term message history. The Durable Object
+  // queue only supplements rows which have not reached Supabase yet.
+  // IMPORTANT: a failed Durable Object queue read must NOT block canonical
+  // history. Previously that read ran before the try/catch, so one unhealthy
+  // realtime request caused GET /api/messages to fail even while Supabase had
+  // the messages. That made messages appear to vanish after refresh.
+  let pending: any[] = [];
   try {
-    // PostgREST commonly caps a response at 1,000 rows. Request the newest
-    // pages first, then restore chronological order for the chat UI.
-    for (let offset = 0; offset < maxHistoryRows; offset += pageSize) {
+    pending = await loadPendingMessagesFromRealtime();
+  } catch (error) {
+    console.warn(
+      'SYNAX realtime pending queue unavailable; continuing with Supabase message history:',
+      error,
+    );
+  }
+
+  const pageSize = 1000;
+  const rows: SupabaseMessageRow[] = [];
+  try {
+    // Read every page rather than silently truncating history at 5,000 rows.
+    // PostgREST commonly caps a response at 1,000 rows. Request newest-first,
+    // then restore chronological order before returning to the chat UI.
+    for (let offset = 0; ; offset += pageSize) {
       const path =
         `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted` +
         `&order=timestamp.desc,id.desc&limit=${pageSize}&offset=${offset}`;
@@ -517,7 +527,7 @@ async function loadMessagesFromSupabase(): Promise<any[]> {
   }
 
   // Client retries and Durable Object pending entries may overlap with rows
-  // already committed to Supabase. Merge them by client id, then database id.
+  // already committed to Supabase. Deduplicate by client ID first, then row ID.
   const unique = new Map<string, SupabaseMessageRow>();
   for (const row of rows) {
     const key = String(row.client_message_id || row.id || '');
@@ -2292,7 +2302,18 @@ export async function createCloudflareHttpServer() {
       const messages = await loadMessagesFromSupabase();
       db.messages = messages;
       res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.json({ messages });
+      // Safe diagnostics help distinguish a successful empty history response
+      // from a storage failure. No keys or secrets are exposed here.
+      let supabaseProjectRef = 'unknown';
+      try { supabaseProjectRef = new URL(SUPABASE_URL).hostname.split('.')[0] || 'unknown'; } catch {}
+      res.json({
+        messages,
+        historyDiagnostics: {
+          source: `public.${SUPABASE_MESSAGES_TABLE}`,
+          count: messages.length,
+          supabaseProjectRef,
+        },
+      });
     } catch (err) {
       console.error('Failed to load messages:', err);
       res.setHeader('Cache-Control', 'no-store, max-age=0');
