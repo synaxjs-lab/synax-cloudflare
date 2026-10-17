@@ -887,12 +887,25 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     };
   }, [otherUser.id, currentUser.id, scheduleVisibleReadCheck]);
 
-  // WebSocket is the normal realtime path. Reconcile immediately after connect,
-  // when returning to the tab, and only poll while disconnected.
+  // WebSocket is the normal realtime path. Reconcile after connect and whenever
+  // the tab returns. If history loading fails while the socket remains open,
+  // retry with backoff instead of waiting for another connection event.
   useEffect(() => {
     let stopped = false;
     let inFlight = false;
     let interval: number | null = null;
+    let retryTimer: number | null = null;
+    let retryDelayMs = 1000;
+
+    const scheduleHistoryRetry = () => {
+      if (stopped || retryTimer !== null || document.visibilityState !== 'visible') return;
+      const delay = retryDelayMs;
+      retryDelayMs = Math.min(retryDelayMs * 2, 15000);
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void refreshMessages();
+      }, delay);
+    };
 
     const refreshMessages = async () => {
       if (stopped || inFlight || document.visibilityState !== 'visible') return;
@@ -903,6 +916,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           const firstHistorySync = !initialHistoryLoadedRef.current;
           setMessages((prev) => mergeChatMessages(prev, latest));
           initialHistoryLoadedRef.current = true;
+          retryDelayMs = 1000;
+          if (retryTimer !== null) {
+            window.clearTimeout(retryTimer);
+            retryTimer = null;
+          }
           if (firstHistorySync && latest.length > 0) {
             requestAnimationFrame(() => {
               const el = messagesContainerRef.current;
@@ -911,7 +929,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           }
         }
       } catch (err) {
-        console.warn('SYNAX message reconciliation failed:', err);
+        // Don't replace the current chat with an empty list on API failure.
+        // Keep retrying even if WebSocket is connected: realtime delivery and
+        // durable history are separate paths.
+        console.warn('SYNAX message reconciliation failed; retrying:', err);
+        scheduleHistoryRetry();
       } finally {
         inFlight = false;
       }
@@ -957,6 +979,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     return () => {
       stopped = true;
       if (interval !== null) window.clearInterval(interval);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
       unsubscribeOpen();
       unsubscribeClosed();
       document.removeEventListener('visibilitychange', handleVisibility);
