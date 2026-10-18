@@ -784,11 +784,14 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     });
 
     const unsubEdit = socketService.on('chat:message_edited', (data) => {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === data.messageId ? { ...m, text: data.text, isEdited: true } : m
-        )
-      );
+      const eventId = String(data?.messageId ?? data?.message?.id ?? '');
+      const eventClientId = String(data?.clientMessageId ?? data?.message?.clientMessageId ?? '');
+      const editedText = String(data?.text ?? data?.message?.text ?? '');
+      setMessages((prev) => prev.map((m) => {
+        const matchesId = eventId && String(m.id) === eventId;
+        const matchesClientId = eventClientId && String(m.clientMessageId || '') === eventClientId;
+        return matchesId || matchesClientId ? { ...m, text: editedText, isEdited: true } : m;
+      }));
     });
 
     const unsubDelete = socketService.on('chat:message_deleted', (data) => {
@@ -1207,7 +1210,18 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   }, []);
 
   const handleEdit = useCallback(async (messageId: string, text: string) => {
-    await ApiService.editMessage(messageId, text);
+    const before = messagesRef.current.find((m) => String(m.id) === String(messageId));
+    const updated = await ApiService.editMessage(messageId, text);
+    const finalText = String(updated?.text ?? text);
+    const clientId = String(updated?.clientMessageId ?? before?.clientMessageId ?? '');
+    // Update the editing user's UI from the successful HTTP response too. The
+    // realtime event updates the other device, but should not be required for
+    // the sender to see their own edit immediately.
+    setMessages((prev) => prev.map((m) =>
+      String(m.id) === String(messageId) || (clientId && String(m.clientMessageId || '') === clientId)
+        ? { ...m, ...(updated || {}), text: finalText, isEdited: true }
+        : m
+    ));
   }, []);
 
   const handleDelete = useCallback(async (messageId: string) => {
