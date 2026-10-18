@@ -2608,8 +2608,17 @@ export async function createCloudflareHttpServer() {
         return;
       }
       const updated = await updateMessageInSupabase(id, { text, is_edited: true });
-      broadcast({ type: 'chat:message_edited', messageId: id, text, isEdited: true });
-      res.json({ success: true, message: updated || { ...msg, text, isEdited: true } });
+      const editedMessage = updated || { ...msg, text, isEdited: true };
+      broadcast({
+        type: 'chat:message_edited',
+        messageId: id,
+        clientMessageId: editedMessage.clientMessageId || msg.clientMessageId,
+        text: editedMessage.text ?? text,
+        isEdited: true,
+        message: editedMessage,
+      });
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.json({ success: true, message: editedMessage });
     } catch (err) {
       console.error('Failed to edit message:', err);
       res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
