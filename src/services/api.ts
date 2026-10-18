@@ -574,12 +574,12 @@ export const ApiService = {
 
     // POST is made idempotent by clientMessageId on the server, so a network
     // retry cannot create a duplicate message after a lost response.
-    const maxAttempts = payload.clientMessageId ? 2 : 1;
+    const maxAttempts = payload.clientMessageId ? 3 : 1;
     let lastError: unknown = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), 8000);
+      const timer = window.setTimeout(() => controller.abort(), 12000);
       try {
         const res = await apiFetch('/api/messages', {
           method: 'POST',
@@ -604,16 +604,19 @@ export const ApiService = {
         // Retry only transient gateway/service failures. Never retry validation
         // or permission errors such as TIME_EXPIRED.
         if (attempt >= maxAttempts || ![408, 425, 429, 500, 502, 503, 504].includes(res.status)) {
-          throw new Error(message);
+          const permanentError = new Error(message) as Error & { retryable?: boolean };
+          permanentError.retryable = false;
+          throw permanentError;
         }
         lastError = new Error(message);
       } catch (error) {
         lastError = error;
-        if (attempt >= maxAttempts) break;
+        if (attempt >= maxAttempts || (error as any)?.retryable === false) break;
         // Abort/network errors are safe to retry because the server deduplicates
-        // by clientMessageId.
+        // by clientMessageId. A short backoff gives weak mobile connections time
+        // to recover without waiting through a long fixed delay.
         if (error instanceof DOMException && error.name !== 'AbortError') break;
-        await new Promise((resolve) => window.setTimeout(resolve, 250 * attempt));
+        await new Promise((resolve) => window.setTimeout(resolve, 350 * attempt));
       } finally {
         window.clearTimeout(timer);
       }
@@ -654,8 +657,8 @@ export const ApiService = {
       },
       body: JSON.stringify({ text }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to edit message');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.detail || `Failed to edit message (HTTP ${res.status})`);
     return data.message;
   },
 
