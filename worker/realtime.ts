@@ -204,45 +204,92 @@ async function assertRealtimeMessagingAllowed(env: Env, userId: UserId): Promise
 }
 
 export class SynaxRealtimeHub extends DurableObject<Env> {
-  private async getLastSeen(userId: UserId): Promise<number> {
-    const cached = normalizeTimestamp((await this.ctx.storage.get<number>(`lastSeen:${userId}`)) || 0);
-    if (cached > 0) return cached;
+  private readonly lastSeenMemory = new Map<UserId, number>();
 
-    // Durable Object storage is local to this DO instance. On a fresh DO
-    // (or after a new deployment) it can be empty even though Supabase has
-    // the real persistent last-seen value. Fall back to Supabase so the UI
-    // never shows a fake/unavailable timestamp after reconnects/deployments.
+  private async getLastSeen(userId: UserId): Promise<number> {
+    const cacheKey = `lastSeen:${userId}`;
+    const checkedKey = `lastSeenChecked:${userId}`;
+    const dirtyKey = `lastSeenDirty:${userId}`;
+    const cached = normalizeTimestamp((await this.ctx.storage.get<number>(cacheKey)) || 0);
+    const checkedAt = Number((await this.ctx.storage.get<number>(checkedKey)) || 0);
+    const dirty = Boolean(await this.ctx.storage.get<boolean>(dirtyKey));
+
+    // Keep a short cache to avoid hitting Supabase on every heartbeat, but
+    // refresh it periodically and retry writes that previously failed.
+    if (cached > 0 && !dirty && Date.now() - checkedAt < 5_000) {
+      this.lastSeenMemory.set(userId, cached);
+      return cached;
+    }
+
     try {
       const response = await supabaseFetch(this.env,
-        `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}&select=last_seen,last_heartbeat&limit=1`
+        `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}&select=last_seen&limit=1`
       );
       const rows = await response.json().catch(() => []);
       const row = Array.isArray(rows) ? rows[0] : null;
-      const lastSeen = normalizeTimestamp(row?.last_seen);
-      if (lastSeen > 0) await this.ctx.storage.put(`lastSeen:${userId}`, lastSeen);
-      return lastSeen;
+      const stored = normalizeTimestamp(row?.last_seen);
+      const latest = Math.max(cached, stored);
+
+      if (latest > 0) {
+        await this.ctx.storage.put(cacheKey, latest);
+        this.lastSeenMemory.set(userId, latest);
+      }
+      await this.ctx.storage.put(checkedKey, Date.now());
+
+      // If the DO has a newer value than Supabase (for example, a previous
+      // PATCH failed), repair the persisted timestamp without changing the
+      // separate usage timer's active/active_started_at fields.
+      if (latest > 0 && (dirty || latest > stored)) {
+        const update = await supabaseFetch(this.env,
+          `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}`,
+          {
+            method: 'PATCH',
+            headers: { Prefer: 'return=representation' },
+            body: JSON.stringify({ last_seen: Math.floor(latest) }),
+          },
+        );
+        const updatedRows = await update.json().catch(() => []);
+        if (!Array.isArray(updatedRows) || updatedRows.length === 0) {
+          await supabaseFetch(this.env, '/rest/v1/synax_user_usage?on_conflict=user_id', {
+            method: 'POST',
+            headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+            body: JSON.stringify({ user_id: userId, last_seen: Math.floor(latest) }),
+          });
+        }
+      }
+
+      await this.ctx.storage.delete(dirtyKey);
+      return latest;
     } catch (error) {
-      console.warn('SYNAX persistent last-seen lookup failed:', error);
-      return 0;
+      console.warn('SYNAX persistent last-seen lookup/sync failed:', error);
+      if (cached > 0) this.lastSeenMemory.set(userId, cached);
+      return cached;
     }
   }
 
   private async setLastSeen(userId: UserId, timestamp: number) {
     if (!Number.isFinite(timestamp) || timestamp <= 0) return;
-    const previous = Number((await this.ctx.storage.get<number>(`lastSeen:${userId}`)) || 0);
-    if (previous >= timestamp) return;
-    await this.ctx.storage.put(`lastSeen:${userId}`, timestamp);
+    const cacheKey = `lastSeen:${userId}`;
+    const checkedKey = `lastSeenChecked:${userId}`;
+    const dirtyKey = `lastSeenDirty:${userId}`;
+    const previous = normalizeTimestamp((await this.ctx.storage.get<number>(cacheKey)) || 0);
+    const latest = Math.max(previous, normalizeTimestamp(timestamp));
+    if (!latest) return;
 
-    // Keep last-seen persistent across Durable Object replacement/restart.
-    // This uses the existing synax_user_usage table; no new presence table is
-    // required. Failure here must not break realtime presence.
+    await this.ctx.storage.put(cacheKey, latest);
+    this.lastSeenMemory.set(userId, latest);
+    await this.ctx.storage.put(dirtyKey, true);
+    await this.ctx.storage.put(checkedKey, 0);
+
     try {
       const response = await supabaseFetch(this.env,
         `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}`,
         {
           method: 'PATCH',
           headers: { Prefer: 'return=representation' },
-          body: JSON.stringify({ last_seen: Math.floor(timestamp), active: false, active_started_at: null }),
+          // Do not set active=false here: `active` and `active_started_at`
+          // also drive the user's time allowance, not just chat presence.
+          body: JSON.stringify({ last_seen: Math.floor(latest) }),
         },
       );
       const rows = await response.json().catch(() => []);
@@ -250,10 +297,14 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
         await supabaseFetch(this.env, '/rest/v1/synax_user_usage?on_conflict=user_id', {
           method: 'POST',
           headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-          body: JSON.stringify({ user_id: userId, active: false, active_started_at: null, last_heartbeat: Math.floor(timestamp), last_seen: Math.floor(timestamp) }),
+          body: JSON.stringify({ user_id: userId, last_seen: Math.floor(latest) }),
         });
       }
+      await this.ctx.storage.delete(dirtyKey);
+      await this.ctx.storage.put(checkedKey, Date.now());
     } catch (error) {
+      // Keep the value in durable DO storage and retry during the next
+      // presence snapshot/alarm; do not let a failed write become permanent.
       console.warn('SYNAX persistent last-seen save failed:', error);
     }
   }
@@ -326,8 +377,8 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
     return {
       person_1: person1,
       person_2: person2,
-      lastSeen_1: 0,
-      lastSeen_2: 0,
+      lastSeen_1: this.lastSeenMemory.get('person_1') || 0,
+      lastSeen_2: this.lastSeenMemory.get('person_2') || 0,
     };
   }
 
@@ -488,13 +539,11 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
     }
     await Promise.all(writes);
 
-    // The Durable Object write above is the first durable commit. Attempt the
-    // canonical Supabase write before acknowledging/broadcasting the message.
-    // If Supabase is temporarily unavailable, persistMessageNow deliberately
-    // leaves the queued row in Durable Object storage and schedules a retry;
-    // /pending-messages can then restore it after a refresh.
-    const persistedToSupabase = await this.persistMessageNow(canonical);
-    if (!persistedToSupabase) await this.ensureMessageAlarm();
+    // The durable queue write above is the immediate commit. Never make the
+    // sender wait for Supabase on the realtime path: a slow REST request used
+    // to add several seconds to every message on weak networks. Keep the queue
+    // entry until Supabase confirms the write; the alarm retries on failure.
+    this.ctx.waitUntil(this.persistEnqueuedMessage(canonical));
 
     const serialized = JSON.stringify({
       type: 'chat:new_message',
@@ -508,8 +557,8 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       message: canonical,
       recipientOnline,
       delivered: recipientOnline,
-      persistedToSupabase,
-      durability: persistedToSupabase ? 'supabase' : 'durable-pending-queue',
+      persistedToSupabase: false,
+      durability: 'durable-pending-queue',
     };
   }
 
@@ -532,7 +581,7 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       const info = socket.deserializeAttachment() as ClientInfo | null;
       if (!info || !isUserId(info.userId) || info.lastHeartbeat >= cutoff) continue;
 
-      if (info.chatActive) {
+      if (info.chatActive && !this.isUserChatActive(info.userId, socket)) {
         await this.setLastSeen(info.userId, info.lastActiveAt || Date.now());
       }
       changed = true;
