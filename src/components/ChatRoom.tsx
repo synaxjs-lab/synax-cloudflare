@@ -890,15 +890,18 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     };
   }, [otherUser.id, currentUser.id, scheduleVisibleReadCheck]);
 
-  // WebSocket is the normal realtime path. Reconcile after connect and whenever
-  // the tab returns. If history loading fails while the socket remains open,
-  // retry with backoff instead of waiting for another connection event.
+  // WebSocket is the instant path. A lightweight recent-message query runs as
+  // a safety net even while the socket is authenticated: browsers can retain an
+  // apparently healthy WebSocket while an individual incoming event is missed.
+  // The endpoint returns only a recent window, never the entire chat history.
   useEffect(() => {
     let stopped = false;
-    let inFlight = false;
+    let historyInFlight = false;
+    let recentInFlight = false;
     let interval: number | null = null;
     let retryTimer: number | null = null;
     let retryDelayMs = 1000;
+    let consecutiveRecentFailures = 0;
 
     const scheduleHistoryRetry = () => {
       if (stopped || retryTimer !== null || document.visibilityState !== 'visible') return;
@@ -906,13 +909,13 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       retryDelayMs = Math.min(retryDelayMs * 2, 15000);
       retryTimer = window.setTimeout(() => {
         retryTimer = null;
-        void refreshMessages();
+        void refreshFullHistory();
       }, delay);
     };
 
-    const refreshMessages = async () => {
-      if (stopped || inFlight || document.visibilityState !== 'visible') return;
-      inFlight = true;
+    const refreshFullHistory = async () => {
+      if (stopped || historyInFlight || document.visibilityState !== 'visible') return;
+      historyInFlight = true;
       try {
         const latest = await ApiService.getMessages();
         if (!stopped) {
@@ -932,13 +935,55 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           }
         }
       } catch (err) {
-        // Don't replace the current chat with an empty list on API failure.
-        // Keep retrying even if WebSocket is connected: realtime delivery and
-        // durable history are separate paths.
-        console.warn('SYNAX message reconciliation failed; retrying:', err);
+        // Keep already-rendered messages on failure and retry with backoff.
+        console.warn('SYNAX message history sync failed; retrying:', err);
         scheduleHistoryRetry();
       } finally {
-        inFlight = false;
+        historyInFlight = false;
+      }
+    };
+
+    const refreshRecentMessages = async () => {
+      if (stopped || recentInFlight || document.visibilityState !== 'visible') return;
+      recentInFlight = true;
+      try {
+        const latest = await ApiService.getRecentMessages();
+        if (!stopped && latest.length) {
+          const current = messagesRef.current;
+          const byId = new Map<string, ChatMessage>(current.map((message) => [String(message.id), message] as const));
+          const byClientId = new Map<string, ChatMessage>(current
+            .filter((message) => message.clientMessageId)
+            .map((message) => [String(message.clientMessageId), message] as const));
+          const statusRank: Record<string, number> = { sent: 0, delivered: 1, read: 2 };
+          const changed = latest.some((incoming) => {
+            const existing = (incoming.clientMessageId && byClientId.get(String(incoming.clientMessageId)))
+              || byId.get(String(incoming.id));
+            if (!existing) return true;
+            return incoming.text !== existing.text
+              || incoming.deleted !== existing.deleted
+              || incoming.isEdited !== existing.isEdited
+              || incoming.isPinned !== existing.isPinned
+              || incoming.fileUrl !== existing.fileUrl
+              || (statusRank[String(incoming.status)] ?? 0) > (statusRank[String(existing.status)] ?? 0)
+              || JSON.stringify(incoming.reactions || {}) !== JSON.stringify(existing.reactions || {});
+          });
+          if (changed) {
+            // Merge by canonical ID/clientMessageId, so a WebSocket event and a
+            // recovery response never create duplicate message bubbles. Skip
+            // state updates when the recent window contains no actual changes.
+            setMessages((prev) => mergeChatMessages(prev, latest));
+          }
+        }
+        consecutiveRecentFailures = 0;
+      } catch (err) {
+        consecutiveRecentFailures += 1;
+        // Avoid filling the console on a genuinely offline connection while
+        // still making repeated failures visible for diagnosis.
+        if (consecutiveRecentFailures === 1 || consecutiveRecentFailures % 5 === 0) {
+          console.warn('SYNAX live message recovery is temporarily unavailable:', err);
+        }
+      } finally {
+        recentInFlight = false;
       }
     };
 
@@ -947,38 +992,36 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         window.clearInterval(interval);
         interval = null;
       }
-      // Keep a lightweight history reconciliation running even when the
-      // WebSocket says it is ready. Some browser/network paths leave a socket
-      // authenticated but stop delivering incoming frames; in that state the
-      // old code stopped polling and the recipient saw new messages only after
-      // reopening the site. The API bypasses browser caching, and mergeChatMessages
-      // deduplicates by message ID/clientMessageId, so this safely fills gaps.
       if (document.visibilityState === 'visible') {
-        interval = window.setInterval(() => { void refreshMessages(); }, 2000);
+        // The bounded recent endpoint catches missed events without fetching
+        // the whole history every time. Keep it running while chat is visible.
+        interval = window.setInterval(() => { void refreshRecentMessages(); }, 2000);
       }
     };
 
     const unsubscribeOpen = socketService.on('connection:open', () => {
-      // A raw WebSocket open is not yet an authenticated realtime connection.
-      // Keep history reconciliation polling until connection:ready arrives.
-      void refreshMessages();
+      void refreshRecentMessages();
       syncPolling();
     });
     const unsubscribeReady = socketService.on('connection:ready', () => {
       socketService.requestPresence();
       socketService.setChatActive(chatActiveRef.current);
       if (chatActiveRef.current) scheduleVisibleReadCheck();
-      void refreshMessages();
+      void refreshRecentMessages();
       syncPolling();
     });
     const unsubscribeClosed = socketService.on('connection:closed', () => {
+      // A reconnect may follow a long outage, so fetch canonical history once;
+      // the small recent endpoint then bridges any subsequent missed events.
+      void refreshFullHistory();
+      void refreshRecentMessages();
       syncPolling();
-      void refreshMessages();
     });
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') {
         socketService.ensureRealtimeNow();
-        void refreshMessages();
+        void refreshFullHistory();
+        void refreshRecentMessages();
         scheduleVisibleReadCheck();
       }
       syncPolling();
@@ -988,7 +1031,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     window.addEventListener('pageshow', handleVisibility);
 
     socketService.ensureRealtimeNow();
-    void refreshMessages();
+    void refreshFullHistory();
+    void refreshRecentMessages();
     syncPolling();
 
     return () => {
@@ -1003,7 +1047,6 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       window.removeEventListener('pageshow', handleVisibility);
     };
   }, [currentUser.id, otherUser.id]);
-
   // Keep the browser clock aligned with the server-authoritative timer.
   useEffect(() => {
     if (!timeStatus) return;
@@ -1141,17 +1184,10 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         return;
       }
 
-      let persisted: any = null;
-      let lastSendError: unknown = null;
-      for (let attempt = 0; attempt < 3 && !persisted; attempt++) {
-        try {
-          persisted = await ApiService.sendMessage({ ...payload, clientMessageId, replyTo: reply });
-        } catch (sendError) {
-          lastSendError = sendError;
-          if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 700 * (attempt + 1)));
-        }
-      }
-      if (!persisted) throw lastSendError || new Error('Message could not be persisted.');
+      // ApiService.sendMessage owns the idempotent HTTP retry policy. Do not
+      // wrap it in another retry loop; nested retries multiplied worst-case
+      // wait time and made a single stalled send feel like it hung for ages.
+      const persisted = await ApiService.sendMessage({ ...payload, clientMessageId, replyTo: reply });
       setMessages((prev) => mergeChatMessages(prev, [persisted]));
     } catch (err: any) {
       // A network error can happen after the server has already accepted the
@@ -1159,7 +1195,13 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       // so a successful server-side send is never made to disappear until refresh.
       let serverAccepted = false;
       try {
-        const latest = await ApiService.getMessages();
+        const latest = await Promise.race([
+          ApiService.getRecentMessages(),
+          new Promise<ChatMessage[]>((_, reject) => window.setTimeout(
+            () => reject(new Error('Message status check timed out.')),
+            3000,
+          )),
+        ]);
         serverAccepted = latest.some((message) => String(message.clientMessageId || '') === clientMessageId);
         if (serverAccepted) {
           setMessages((prev) => mergeChatMessages(prev, latest));
