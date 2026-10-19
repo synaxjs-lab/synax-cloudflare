@@ -118,12 +118,16 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
   const [audioProgress, setAudioProgress] = useState(0);
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const [showActionsMenu, setShowActionsMenu] = useState(false);
+  const [desktopActionsDismissed, setDesktopActionsDismissed] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(message.text || '');
   const [copied, setCopied] = useState(false);
   const [reactionBurst, setReactionBurst] = useState<{ emoji: string; id: number } | null>(null);
   const [reactionPickerPosition, setReactionPickerPosition] = useState<{ left: number; top: number } | null>(null);
 
+  const messageRowRef = useRef<HTMLDivElement | null>(null);
+  const mobileActionsMenuRef = useRef<HTMLDivElement | null>(null);
+  const desktopActionsRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
   const swipeTrackingRef = useRef(false);
@@ -182,6 +186,65 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
     if (reactionBurstTimerRef.current !== null) window.clearTimeout(reactionBurstTimerRef.current);
   }, []);
 
+  // Action menus are local to a message, so explicitly dismiss them when the
+  // user taps elsewhere. The desktop reaction tray is portalled to document.body;
+  // treat it as inside the message so tapping an emoji is not mistaken for an
+  // outside click before its click handler runs.
+  useEffect(() => {
+    if (!showActionsMenu && !showReactionPicker) return;
+
+    const handleOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      const element = target instanceof Element ? target : null;
+      if (element?.closest('.synax-reaction-picker')) return;
+      if (target instanceof Node && desktopActionsRef.current?.contains(target)) return;
+      if (target instanceof Node && mobileActionsMenuRef.current?.contains(target)) return;
+      // On phones, the message row itself is the tap-to-toggle target. On
+      // desktop, tapping the bubble while its emoji tray is open should dismiss it.
+      if (window.matchMedia('(max-width: 767px)').matches &&
+          target instanceof Node && messageRowRef.current?.contains(target)) return;
+      setShowActionsMenu(false);
+      setShowReactionPicker(false);
+      setReactionPickerPosition(null);
+      if (!window.matchMedia('(max-width: 767px)').matches) setDesktopActionsDismissed(true);
+    };
+
+    const closeMenus = () => {
+      setShowActionsMenu(false);
+      setShowReactionPicker(false);
+      setReactionPickerPosition(null);
+      if (!window.matchMedia('(max-width: 767px)').matches) setDesktopActionsDismissed(true);
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenus();
+    };
+
+    document.addEventListener('pointerdown', handleOutsidePointer, true);
+    window.addEventListener('keydown', handleEscape);
+    const handleScrollOrResize = () => {
+      setShowActionsMenu(false);
+      setShowReactionPicker(false);
+      setReactionPickerPosition(null);
+      if (!window.matchMedia('(max-width: 767px)').matches) setDesktopActionsDismissed(true);
+    };
+    window.addEventListener('scroll', handleScrollOrResize, true);
+    window.addEventListener('resize', handleScrollOrResize);
+
+    return () => {
+      document.removeEventListener('pointerdown', handleOutsidePointer, true);
+      window.removeEventListener('keydown', handleEscape);
+      window.removeEventListener('scroll', handleScrollOrResize, true);
+      window.removeEventListener('resize', handleScrollOrResize);
+    };
+  }, [showActionsMenu, showReactionPicker]);
+
+  const closeMessageMenus = (dismissDesktopActions = false) => {
+    setShowActionsMenu(false);
+    setShowReactionPicker(false);
+    setReactionPickerPosition(null);
+    if (dismissDesktopActions) setDesktopActionsDismissed(true);
+  };
+
   const triggerReaction = (emoji: string) => {
     setReactionBurst({ emoji, id: Date.now() + Math.random() });
     if (reactionBurstTimerRef.current !== null) window.clearTimeout(reactionBurstTimerRef.current);
@@ -190,7 +253,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
       reactionBurstTimerRef.current = null;
     }, 430);
     onReact(message.id, emoji);
-    setShowReactionPicker(false);
+    closeMessageMenus(true);
   };
 
   const toggleReactionPicker = () => {
@@ -308,6 +371,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
 
   return (
     <div
+      ref={messageRowRef}
       id={`msg-${message.id}`}
       data-message-id={message.id}
       className={`synax-message-row group relative flex w-full gap-2.5 sm:gap-3 my-2.5 px-1.5 sm:px-2 md:px-4 rounded-2xl ${isMe ? 'flex-row-reverse' : 'flex-row'} ${isHighlighted ? 'bg-indigo-500/10 ring-1 ring-indigo-400/70 shadow-[0_0_30px_rgba(99,102,241,0.28)]' : ''}`}
@@ -321,17 +385,22 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerCancel}
+      onMouseLeave={() => setDesktopActionsDismissed(false)}
       onClick={() => {
         if (suppressClickRef.current) return;
-        if (
-          typeof window !== 'undefined' &&
-          window.matchMedia('(max-width: 767px)').matches &&
-          !message.deleted &&
-          !isEditing
-        ) {
-          setShowActionsMenu((prev) => !prev);
-          setShowReactionPicker(false);
+        if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
+          if (!message.deleted && !isEditing) {
+            setShowActionsMenu((prev) => !prev);
+            setShowReactionPicker(false);
+          }
+          return;
         }
+        // Clicking a desktop message closes its hover toolbar. The toolbar has
+        // its own stopPropagation handler, so clicking an action still works.
+        setShowActionsMenu(false);
+        setShowReactionPicker(false);
+        setReactionPickerPosition(null);
+        setDesktopActionsDismissed(true);
       }}
     >
       {swipeOffset > 0 && !message.deleted && (
@@ -603,6 +672,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
         {/* Mobile actions: tap the message; no three-dot button */}
         {!message.deleted && showActionsMenu && (
           <div
+            ref={mobileActionsMenuRef}
             className={`md:hidden mt-1.5 flex flex-wrap items-center gap-1 p-1.5 rounded-2xl bg-slate-950 border border-slate-700/80 shadow-lg max-w-full ${
               isMe ? 'justify-end' : 'justify-start'
             }`}
@@ -725,7 +795,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
         {/* Desktop hover actions */}
         {!message.deleted && (
           <div
-            className={`hidden md:flex absolute top-0 opacity-0 group-hover:opacity-100 items-center gap-1 p-1 rounded-xl bg-slate-900/95 border border-slate-700/80 shadow-lg backdrop-blur-md z-20 ${
+            ref={desktopActionsRef}
+            className={`hidden md:flex absolute top-0 ${desktopActionsDismissed ? 'opacity-0 pointer-events-none' : 'opacity-0 group-hover:opacity-100'} items-center gap-1 p-1 rounded-xl bg-slate-900/95 border border-slate-700/80 shadow-lg backdrop-blur-md z-20 ${
               isMe ? 'right-full mr-2' : 'left-full ml-2'
             }`}
             onClick={(e) => e.stopPropagation()}
@@ -768,7 +839,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
 
             <button
               type="button"
-              onClick={() => onReply(message)}
+              onClick={() => { onReply(message); closeMessageMenus(true); }}
               className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
               title="Reply"
             >
@@ -777,7 +848,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
 
             <button
               type="button"
-              onClick={() => onPin(message.id)}
+              onClick={() => { onPin(message.id); closeMessageMenus(true); }}
               className="p-1.5 rounded-lg text-slate-400 hover:text-amber-300 hover:bg-slate-800"
               title={message.isPinned ? 'Unpin' : 'Pin'}
             >
@@ -791,7 +862,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             {message.text && (
               <button
                 type="button"
-                onClick={handleCopy}
+                onClick={() => { handleCopy(); closeMessageMenus(true); }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
                 title="Copy"
               >
@@ -806,7 +877,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             {isMe && message.type === 'text' && (
               <button
                 type="button"
-                onClick={() => setIsEditing(true)}
+                onClick={() => { setIsEditing(true); closeMessageMenus(true); }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
                 title="Edit"
               >
@@ -817,7 +888,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             {isMe && (
               <button
                 type="button"
-                onClick={() => onDelete(message.id)}
+                onClick={() => { onDelete(message.id); closeMessageMenus(true); }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-slate-800"
                 title="Delete for everyone"
               >
