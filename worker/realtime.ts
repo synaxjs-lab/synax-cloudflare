@@ -123,47 +123,51 @@ class RealtimeMessagePolicyError extends Error {
 }
 
 /**
- * Cache only the raw policy rows very briefly. Every send still re-evaluates
- * the time limit against the current clock, but bursts of messages don't each
- * pay two Supabase network round-trips before the recipient can see them.
- * A short TTL bounds how long admin settings or usage updates can be stale.
+ * Cache the raw policy rows briefly. The expiry calculation still runs for
+ * every send, while a proactive refresh from heartbeats prevents a message
+ * from waiting on two Supabase reads when the cache is about to expire.
  */
-const MESSAGE_POLICY_CACHE_TTL_MS = 4_500;
+const MESSAGE_POLICY_CACHE_TTL_MS = 5_000;
 type MessagePolicySnapshot = { appState: any; usage: any };
-const messagePolicyCache = new Map<UserId, {
-  expiresAt: number;
-  promise: Promise<MessagePolicySnapshot>;
-}>();
+type MessagePolicyCacheEntry = { expiresAt: number; promise: Promise<MessagePolicySnapshot> };
+const messagePolicyCache = new Map<UserId, MessagePolicyCacheEntry>();
+const messagePolicyRefreshes = new Map<UserId, Promise<MessagePolicySnapshot>>();
+
+async function fetchMessagePolicySnapshot(env: Env, userId: UserId): Promise<MessagePolicySnapshot> {
+  const [stateResponse, usageResponse] = await Promise.all([
+    supabaseFetch(env, '/rest/v1/synax_state?id=eq.main&select=state&limit=1'),
+    supabaseFetch(
+      env,
+      `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}` +
+      '&select=user_id,daily_used_seconds,continuous_used_seconds,active,active_started_at,last_heartbeat&limit=1',
+    ),
+  ]);
+  const stateRows = await stateResponse.json() as Array<{ state: any }>;
+  const usageRows = await usageResponse.json() as any[];
+  return { appState: stateRows[0]?.state, usage: usageRows[0] };
+}
 
 async function readMessagePolicySnapshot(env: Env, userId: UserId): Promise<MessagePolicySnapshot> {
   const now = Date.now();
   const cached = messagePolicyCache.get(userId);
-  if (cached && now < cached.expiresAt) return cached.promise;
+  if (cached && (cached.expiresAt === Number.POSITIVE_INFINITY || now < cached.expiresAt)) {
+    return cached.promise;
+  }
+  // If a heartbeat already started a proactive refresh, use that request rather
+  // than launching another duplicate policy read after the old entry expires.
+  const refreshing = messagePolicyRefreshes.get(userId);
+  if (refreshing) return refreshing;
 
-  // Concurrent messages share the same in-flight read instead of stacking
-  // identical Supabase requests behind the chat send path.
-  const entry: { expiresAt: number; promise: Promise<MessagePolicySnapshot> } = {
+  const entry: MessagePolicyCacheEntry = {
     expiresAt: Number.POSITIVE_INFINITY,
-    promise: Promise.resolve({ appState: null, usage: null }),
+    promise: fetchMessagePolicySnapshot(env, userId),
   };
-  entry.promise = (async () => {
-    const [stateResponse, usageResponse] = await Promise.all([
-      supabaseFetch(env, '/rest/v1/synax_state?id=eq.main&select=state&limit=1'),
-      supabaseFetch(
-        env,
-        `/rest/v1/synax_user_usage?user_id=eq.${encodeURIComponent(userId)}` +
-        '&select=user_id,daily_used_seconds,continuous_used_seconds,active,active_started_at,last_heartbeat&limit=1',
-      ),
-    ]);
-    const stateRows = await stateResponse.json() as Array<{ state: any }>;
-    const usageRows = await usageResponse.json() as any[];
-    return { appState: stateRows[0]?.state, usage: usageRows[0] };
-  })();
   messagePolicyCache.set(userId, entry);
-
   try {
     const snapshot = await entry.promise;
-    entry.expiresAt = Date.now() + MESSAGE_POLICY_CACHE_TTL_MS;
+    if (messagePolicyCache.get(userId) === entry) {
+      entry.expiresAt = Date.now() + MESSAGE_POLICY_CACHE_TTL_MS;
+    }
     return snapshot;
   } catch (error) {
     if (messagePolicyCache.get(userId) === entry) messagePolicyCache.delete(userId);
@@ -171,6 +175,37 @@ async function readMessagePolicySnapshot(env: Env, userId: UserId): Promise<Mess
   }
 }
 
+async function refreshMessagePolicySnapshot(env: Env, userId: UserId): Promise<MessagePolicySnapshot> {
+  const cached = messagePolicyCache.get(userId);
+  if (!cached || cached.expiresAt === Number.POSITIVE_INFINITY) {
+    return readMessagePolicySnapshot(env, userId);
+  }
+  // Keep serving the still-valid snapshot while the refresh runs. This avoids
+  // making a just-arrived message wait on the refresh started by a heartbeat.
+  if (cached.expiresAt - Date.now() > 2_000) return cached.promise;
+  const existing = messagePolicyRefreshes.get(userId);
+  if (existing) return existing;
+
+  const refresh = fetchMessagePolicySnapshot(env, userId);
+  messagePolicyRefreshes.set(userId, refresh);
+  try {
+    const snapshot = await refresh;
+    messagePolicyCache.set(userId, {
+      expiresAt: Date.now() + MESSAGE_POLICY_CACHE_TTL_MS,
+      promise: Promise.resolve(snapshot),
+    });
+    return snapshot;
+  } catch (error) {
+    // Do not invalidate a still-valid snapshot because a proactive refresh
+    // failed. A later heartbeat will retry; expired snapshots fail closed.
+    if (cached.expiresAt <= Date.now() && messagePolicyCache.get(userId) === cached) {
+      messagePolicyCache.delete(userId);
+    }
+    throw error;
+  } finally {
+    if (messagePolicyRefreshes.get(userId) === refresh) messagePolicyRefreshes.delete(userId);
+  }
+}
 /**
  * Enforce message expiry on the authenticated WebSocket path as well as HTTP.
  * WebSocket chat sends bypass /api/messages, so relying on its Express
@@ -1023,7 +1058,7 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
         // Refresh policy data from the heartbeat path in the background. This
         // keeps normal sends fast while expiry is still recalculated per send.
         this.ctx.waitUntil(
-          readMessagePolicySnapshot(this.env, info.userId)
+          refreshMessagePolicySnapshot(this.env, info.userId)
             .then(() => undefined)
             .catch((error) => { console.warn('SYNAX message-policy refresh failed:', error); }),
         );
