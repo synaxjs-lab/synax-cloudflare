@@ -947,12 +947,18 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         window.clearInterval(interval);
         interval = null;
       }
-      if (!socketService.isConnected() && document.visibilityState === 'visible') {
+      if (!socketService.isRealtimeReady() && document.visibilityState === 'visible') {
         interval = window.setInterval(() => { void refreshMessages(); }, 2000);
       }
     };
 
     const unsubscribeOpen = socketService.on('connection:open', () => {
+      // A raw WebSocket open is not yet an authenticated realtime connection.
+      // Keep history reconciliation polling until connection:ready arrives.
+      void refreshMessages();
+      syncPolling();
+    });
+    const unsubscribeReady = socketService.on('connection:ready', () => {
       socketService.requestPresence();
       socketService.setChatActive(chatActiveRef.current);
       if (chatActiveRef.current) scheduleVisibleReadCheck();
@@ -984,6 +990,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       if (interval !== null) window.clearInterval(interval);
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       unsubscribeOpen();
+      unsubscribeReady();
       unsubscribeClosed();
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('online', handleVisibility);
