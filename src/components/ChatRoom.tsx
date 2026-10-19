@@ -947,7 +947,13 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         window.clearInterval(interval);
         interval = null;
       }
-      if (!socketService.isRealtimeReady() && document.visibilityState === 'visible') {
+      // Keep a lightweight history reconciliation running even when the
+      // WebSocket says it is ready. Some browser/network paths leave a socket
+      // authenticated but stop delivering incoming frames; in that state the
+      // old code stopped polling and the recipient saw new messages only after
+      // reopening the site. The API bypasses browser caching, and mergeChatMessages
+      // deduplicates by message ID/clientMessageId, so this safely fills gaps.
+      if (document.visibilityState === 'visible') {
         interval = window.setInterval(() => { void refreshMessages(); }, 2000);
       }
     };
