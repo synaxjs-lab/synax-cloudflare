@@ -118,16 +118,19 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
   const [audioProgress, setAudioProgress] = useState(0);
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const [showActionsMenu, setShowActionsMenu] = useState(false);
-  const [desktopActionsDismissed, setDesktopActionsDismissed] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(message.text || '');
   const [copied, setCopied] = useState(false);
   const [reactionBurst, setReactionBurst] = useState<{ emoji: string; id: number } | null>(null);
   const [reactionPickerPosition, setReactionPickerPosition] = useState<{ left: number; top: number } | null>(null);
 
+  // Refs are used only to close a reaction/action menu when the user clicks
+  // outside it. They do not change the message layout or chat behavior.
   const messageRowRef = useRef<HTMLDivElement | null>(null);
   const mobileActionsMenuRef = useRef<HTMLDivElement | null>(null);
   const desktopActionsRef = useRef<HTMLDivElement | null>(null);
+  const desktopReactionPickerRef = useRef<HTMLDivElement | null>(null);
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
   const swipeTrackingRef = useRef(false);
@@ -186,63 +189,61 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
     if (reactionBurstTimerRef.current !== null) window.clearTimeout(reactionBurstTimerRef.current);
   }, []);
 
-  // Action menus are local to a message, so explicitly dismiss them when the
-  // user taps elsewhere. The desktop reaction tray is portalled to document.body;
-  // treat it as inside the message so tapping an emoji is not mistaken for an
-  // outside click before its click handler runs.
+  // Close only this message's menus when the user interacts elsewhere.
+  // The desktop reaction picker is rendered through a portal, so its own ref
+  // must be treated as inside the menu even though it is outside the message row.
   useEffect(() => {
     if (!showActionsMenu && !showReactionPicker) return;
-
-    const handleOutsidePointer = (event: PointerEvent) => {
-      const target = event.target;
-      const element = target instanceof Element ? target : null;
-      if (element?.closest('.synax-reaction-picker')) return;
-      if (target instanceof Node && desktopActionsRef.current?.contains(target)) return;
-      if (target instanceof Node && mobileActionsMenuRef.current?.contains(target)) return;
-      // On phones, the message row itself is the tap-to-toggle target. On
-      // desktop, tapping the bubble while its emoji tray is open should dismiss it.
-      if (window.matchMedia('(max-width: 767px)').matches &&
-          target instanceof Node && messageRowRef.current?.contains(target)) return;
-      setShowActionsMenu(false);
-      setShowReactionPicker(false);
-      setReactionPickerPosition(null);
-      if (!window.matchMedia('(max-width: 767px)').matches) setDesktopActionsDismissed(true);
-    };
 
     const closeMenus = () => {
       setShowActionsMenu(false);
       setShowReactionPicker(false);
       setReactionPickerPosition(null);
-      if (!window.matchMedia('(max-width: 767px)').matches) setDesktopActionsDismissed(true);
-    };
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeMenus();
     };
 
-    document.addEventListener('pointerdown', handleOutsidePointer, true);
-    window.addEventListener('keydown', handleEscape);
-    const handleScrollOrResize = () => {
-      setShowActionsMenu(false);
-      setShowReactionPicker(false);
-      setReactionPickerPosition(null);
-      if (!window.matchMedia('(max-width: 767px)').matches) setDesktopActionsDismissed(true);
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        closeMenus();
+        return;
+      }
+
+      if (desktopReactionPickerRef.current?.contains(target)) return;
+      if (desktopActionsRef.current?.contains(target)) return;
+      if (mobileActionsMenuRef.current?.contains(target)) return;
+
+      // On mobile, tapping the message itself is the existing open/close toggle.
+      // Let its own click handler decide instead of closing during pointer-down.
+      if (
+        window.matchMedia('(max-width: 767px)').matches &&
+        messageRowRef.current?.contains(target)
+      ) return;
+
+      closeMenus();
     };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenus();
+    };
+    const handleScrollOrResize = () => closeMenus();
+
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown);
     window.addEventListener('scroll', handleScrollOrResize, true);
     window.addEventListener('resize', handleScrollOrResize);
 
     return () => {
-      document.removeEventListener('pointerdown', handleOutsidePointer, true);
-      window.removeEventListener('keydown', handleEscape);
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('scroll', handleScrollOrResize, true);
       window.removeEventListener('resize', handleScrollOrResize);
     };
   }, [showActionsMenu, showReactionPicker]);
 
-  const closeMessageMenus = (dismissDesktopActions = false) => {
+  const closeMessageMenus = () => {
     setShowActionsMenu(false);
     setShowReactionPicker(false);
     setReactionPickerPosition(null);
-    if (dismissDesktopActions) setDesktopActionsDismissed(true);
   };
 
   const triggerReaction = (emoji: string) => {
@@ -252,8 +253,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
       setReactionBurst(null);
       reactionBurstTimerRef.current = null;
     }, 430);
+    closeMessageMenus();
     onReact(message.id, emoji);
-    closeMessageMenus(true);
   };
 
   const toggleReactionPicker = () => {
@@ -385,22 +386,17 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerCancel}
-      onMouseLeave={() => setDesktopActionsDismissed(false)}
       onClick={() => {
         if (suppressClickRef.current) return;
-        if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
-          if (!message.deleted && !isEditing) {
-            setShowActionsMenu((prev) => !prev);
-            setShowReactionPicker(false);
-          }
-          return;
+        if (
+          typeof window !== 'undefined' &&
+          window.matchMedia('(max-width: 767px)').matches &&
+          !message.deleted &&
+          !isEditing
+        ) {
+          setShowActionsMenu((prev) => !prev);
+          setShowReactionPicker(false);
         }
-        // Clicking a desktop message closes its hover toolbar. The toolbar has
-        // its own stopPropagation handler, so clicking an action still works.
-        setShowActionsMenu(false);
-        setShowReactionPicker(false);
-        setReactionPickerPosition(null);
-        setDesktopActionsDismissed(true);
       }}
     >
       {swipeOffset > 0 && !message.deleted && (
@@ -697,11 +693,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
                     <button
                       key={emoji}
                       type="button"
-                      onClick={() => {
-                        triggerReaction(emoji);
-                        setShowReactionPicker(false);
-                        setShowActionsMenu(false);
-                      }}
+                      onClick={() => triggerReaction(emoji)}
                       className="w-9 h-9 rounded-xl flex items-center justify-center text-base active:bg-slate-800"
                       aria-label={`React ${emoji}`}
                     >
@@ -715,9 +707,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             <button
               type="button"
               onClick={() => {
+                closeMessageMenus();
                 onReply(message);
-                setShowActionsMenu(false);
-                setShowReactionPicker(false);
               }}
               className="w-9 h-9 rounded-xl flex items-center justify-center text-slate-300 bg-slate-900"
               aria-label="Reply"
@@ -728,9 +719,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             <button
               type="button"
               onClick={() => {
+                closeMessageMenus();
                 onPin(message.id);
-                setShowActionsMenu(false);
-                setShowReactionPicker(false);
               }}
               className="w-9 h-9 rounded-xl flex items-center justify-center text-slate-300 bg-slate-900"
               aria-label={message.isPinned ? 'Unpin' : 'Pin'}
@@ -746,8 +736,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
               <button
                 type="button"
                 onClick={async () => {
+                  closeMessageMenus();
                   await handleCopy();
-                  setShowActionsMenu(false);
                 }}
                 className="w-9 h-9 rounded-xl flex items-center justify-center text-slate-300 bg-slate-900"
                 aria-label="Copy"
@@ -764,9 +754,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  closeMessageMenus();
                   setIsEditing(true);
-                  setShowActionsMenu(false);
-                  setShowReactionPicker(false);
                 }}
                 className="w-9 h-9 rounded-xl flex items-center justify-center text-slate-300 bg-slate-900"
                 aria-label="Edit"
@@ -779,9 +768,8 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  closeMessageMenus();
                   onDelete(message.id);
-                  setShowActionsMenu(false);
-                  setShowReactionPicker(false);
                 }}
                 className="w-9 h-9 rounded-xl flex items-center justify-center text-red-300 bg-slate-900"
                 aria-label="Delete"
@@ -796,7 +784,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
         {!message.deleted && (
           <div
             ref={desktopActionsRef}
-            className={`hidden md:flex absolute top-0 ${desktopActionsDismissed ? 'opacity-0 pointer-events-none' : 'opacity-0 group-hover:opacity-100'} items-center gap-1 p-1 rounded-xl bg-slate-900/95 border border-slate-700/80 shadow-lg backdrop-blur-md z-20 ${
+            className={`hidden md:flex absolute top-0 opacity-0 group-hover:opacity-100 items-center gap-1 p-1 rounded-xl bg-slate-900/95 border border-slate-700/80 shadow-lg backdrop-blur-md z-20 ${
               isMe ? 'right-full mr-2' : 'left-full ml-2'
             }`}
             onClick={(e) => e.stopPropagation()}
@@ -816,6 +804,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
 
               {showReactionPicker && reactionPickerPosition && typeof document !== 'undefined' && createPortal(
                 <div
+                  ref={desktopReactionPickerRef}
                   className="fixed flex items-center gap-1 p-1.5 rounded-2xl bg-slate-900/98 border border-slate-700 shadow-2xl z-[9999] synax-reaction-picker"
                   style={{ left: reactionPickerPosition.left, top: reactionPickerPosition.top }}
                   onMouseDown={(e) => e.stopPropagation()}
@@ -839,7 +828,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
 
             <button
               type="button"
-              onClick={() => { onReply(message); closeMessageMenus(true); }}
+              onClick={() => { closeMessageMenus(); onReply(message); }}
               className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
               title="Reply"
             >
@@ -848,7 +837,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
 
             <button
               type="button"
-              onClick={() => { onPin(message.id); closeMessageMenus(true); }}
+              onClick={() => { closeMessageMenus(); onPin(message.id); }}
               className="p-1.5 rounded-lg text-slate-400 hover:text-amber-300 hover:bg-slate-800"
               title={message.isPinned ? 'Unpin' : 'Pin'}
             >
@@ -862,7 +851,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             {message.text && (
               <button
                 type="button"
-                onClick={() => { handleCopy(); closeMessageMenus(true); }}
+                onClick={() => { closeMessageMenus(); handleCopy(); }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
                 title="Copy"
               >
@@ -877,7 +866,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             {isMe && message.type === 'text' && (
               <button
                 type="button"
-                onClick={() => { setIsEditing(true); closeMessageMenus(true); }}
+                onClick={() => { closeMessageMenus(); setIsEditing(true); }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
                 title="Edit"
               >
@@ -888,7 +877,7 @@ const MessageItemComponent: React.FC<MessageItemProps> = ({
             {isMe && (
               <button
                 type="button"
-                onClick={() => { onDelete(message.id); closeMessageMenus(true); }}
+                onClick={() => { closeMessageMenus(); onDelete(message.id); }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-slate-800"
                 title="Delete for everyone"
               >
