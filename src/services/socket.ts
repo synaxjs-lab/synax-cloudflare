@@ -10,6 +10,9 @@ class SocketService {
   private reconnectAttempts = 0;
   private chatActive = false;
   private heartbeatTimer: number | null = null;
+  private connectionWatchdogTimer: number | null = null;
+  private authTimeoutTimer: number | null = null;
+  private lastServerMessageAt = 0;
   private authenticated = false;
   // Preserve the latest typing state across a temporary WebSocket reconnect.
   // This prevents a user who is already typing from being invisible simply
@@ -105,6 +108,7 @@ class SocketService {
 
         this.ws.onopen = () => {
         this.isConnecting = false;
+        this.lastServerMessageAt = Date.now();
         this.reconnectAttempts = 0;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
@@ -116,14 +120,29 @@ class SocketService {
           token: this.token,
           active: document.visibilityState === 'visible',
         });
-        this.emit('connection:open', { status: 'connected' });
+        // Don't treat an open TCP/WebSocket as a healthy, authenticated chat
+        // connection. If auth stalls, close it so recovery polling can run.
+        if (this.authTimeoutTimer !== null) window.clearTimeout(this.authTimeoutTimer);
+        const openedSocket = this.ws;
+        this.authTimeoutTimer = window.setTimeout(() => {
+          if (this.ws === openedSocket && !this.authenticated) {
+            try { openedSocket?.close(4001, 'Realtime authentication timed out'); } catch {}
+          }
+        }, 7000);
+        this.emit('connection:open', { status: 'connecting' });
       };
 
       this.ws.onmessage = (event) => {
+        this.lastServerMessageAt = Date.now();
         try {
           const payload = JSON.parse(event.data);
           if (payload.type === 'auth:success') {
             this.authenticated = true;
+            this.lastServerMessageAt = Date.now();
+            if (this.authTimeoutTimer !== null) {
+              window.clearTimeout(this.authTimeoutTimer);
+              this.authTimeoutTimer = null;
+            }
             for (const resolve of this.realtimeReadyWaiters) resolve(true);
             this.realtimeReadyWaiters.clear();
             // Re-apply the desired chat-focus state after every reconnect and
@@ -133,6 +152,7 @@ class SocketService {
             this.send({ type: 'chat:active', active });
             this.startHeartbeat();
             this.send({ type: 'presence:heartbeat', active });
+            this.emit('connection:ready', { status: 'authenticated' });
             if (payload.presence) {
               this.emit('presence:update', { type: 'presence:update', presence: payload.presence });
             }
@@ -163,6 +183,10 @@ class SocketService {
 
         this.ws.onclose = () => {
         this.isConnecting = false;
+        if (this.authTimeoutTimer !== null) {
+          window.clearTimeout(this.authTimeoutTimer);
+          this.authTimeoutTimer = null;
+        }
         this.stopHeartbeat();
         this.authenticated = false;
         this.emit('connection:closed', { status: 'disconnected' });
@@ -201,12 +225,26 @@ class SocketService {
 
     beat();
     this.heartbeatTimer = window.setInterval(beat, 4_000);
+
+    // WebSockets can remain OPEN in the browser after the network path has
+    // stalled. The server directly acknowledges each heartbeat; if those
+    // acknowledgements stop, force a reconnect and let chat polling bridge it.
+    this.connectionWatchdogTimer = window.setInterval(() => {
+      if (this.ws?.readyState !== WebSocket.OPEN || !this.authenticated) return;
+      if (Date.now() - this.lastServerMessageAt > 9_000) {
+        try { this.ws.close(4000, 'Realtime heartbeat timed out'); } catch {}
+      }
+    }, 3_000);
   }
 
   private stopHeartbeat() {
     if (this.heartbeatTimer !== null) {
       window.clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+    if (this.connectionWatchdogTimer !== null) {
+      window.clearInterval(this.connectionWatchdogTimer);
+      this.connectionWatchdogTimer = null;
     }
   }
 
@@ -237,7 +275,7 @@ class SocketService {
     return Boolean(this.ws?.readyState === WebSocket.OPEN && this.authenticated);
   }
 
-  private async waitForRealtimeReady(timeoutMs = 450): Promise<boolean> {
+  private async waitForRealtimeReady(timeoutMs = 800): Promise<boolean> {
     if (this.isRealtimeReady()) return true;
     this.ensureRealtimeNow();
     if (this.isRealtimeReady()) return true;
@@ -255,10 +293,16 @@ class SocketService {
     });
   }
 
-  async sendChatMessage(message: any, timeoutMs = 3500): Promise<any | null> {
+  async sendChatMessage(message: any, timeoutMs = 2000): Promise<any | null> {
     const clientMessageId = String(message?.clientMessageId || '').trim();
     if (!clientMessageId) return null;
-    if (!(await this.waitForRealtimeReady(1200))) return null;
+    // A connection can remain OPEN even when its receive path has stalled.
+    // In that case, let the idempotent HTTP fallback run instead of waiting.
+    if (this.isRealtimeReady() && Date.now() - this.lastServerMessageAt > 8_000) {
+      try { this.ws?.close(4000, 'Realtime connection stale before send'); } catch {}
+      return null;
+    }
+    if (!(await this.waitForRealtimeReady(800))) return null;
 
     const resultPromise = new Promise<any | null>((resolve) => {
       const timer = window.setTimeout(() => {
@@ -289,7 +333,7 @@ class SocketService {
   }
 
   isConnected() {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.isRealtimeReady();
   }
 
   /**
@@ -531,6 +575,10 @@ class SocketService {
     }
     this.stopCallPolling();
     this.stopHeartbeat();
+    if (this.authTimeoutTimer !== null) {
+      window.clearTimeout(this.authTimeoutTimer);
+      this.authTimeoutTimer = null;
+    }
     this.pendingCallEvents.clear();
     this.seenCallSignalIds.clear();
     this.token = null;
