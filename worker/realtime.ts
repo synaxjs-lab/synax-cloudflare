@@ -123,15 +123,30 @@ class RealtimeMessagePolicyError extends Error {
 }
 
 /**
- * Enforce message expiry on the authenticated WebSocket path as well as HTTP.
- * WebSocket chat sends bypass /api/messages, so relying on its Express
- * middleware alone allows a logged-in socket to keep sending after expiry.
- * Use the same persisted state and usage row as server.cloudflare.ts.
+ * Cache only the raw policy rows very briefly. Every send still re-evaluates
+ * the time limit against the current clock, but bursts of messages don't each
+ * pay two Supabase network round-trips before the recipient can see them.
+ * A short TTL bounds how long admin settings or usage updates can be stale.
  */
-async function assertRealtimeMessagingAllowed(env: Env, userId: UserId): Promise<void> {
-  let appState: any;
-  let usage: any;
-  try {
+const MESSAGE_POLICY_CACHE_TTL_MS = 4_500;
+type MessagePolicySnapshot = { appState: any; usage: any };
+const messagePolicyCache = new Map<UserId, {
+  expiresAt: number;
+  promise: Promise<MessagePolicySnapshot>;
+}>();
+
+async function readMessagePolicySnapshot(env: Env, userId: UserId): Promise<MessagePolicySnapshot> {
+  const now = Date.now();
+  const cached = messagePolicyCache.get(userId);
+  if (cached && now < cached.expiresAt) return cached.promise;
+
+  // Concurrent messages share the same in-flight read instead of stacking
+  // identical Supabase requests behind the chat send path.
+  const entry: { expiresAt: number; promise: Promise<MessagePolicySnapshot> } = {
+    expiresAt: Number.POSITIVE_INFINITY,
+    promise: Promise.resolve({ appState: null, usage: null }),
+  };
+  entry.promise = (async () => {
     const [stateResponse, usageResponse] = await Promise.all([
       supabaseFetch(env, '/rest/v1/synax_state?id=eq.main&select=state&limit=1'),
       supabaseFetch(
@@ -142,8 +157,33 @@ async function assertRealtimeMessagingAllowed(env: Env, userId: UserId): Promise
     ]);
     const stateRows = await stateResponse.json() as Array<{ state: any }>;
     const usageRows = await usageResponse.json() as any[];
-    appState = stateRows[0]?.state;
-    usage = usageRows[0];
+    return { appState: stateRows[0]?.state, usage: usageRows[0] };
+  })();
+  messagePolicyCache.set(userId, entry);
+
+  try {
+    const snapshot = await entry.promise;
+    entry.expiresAt = Date.now() + MESSAGE_POLICY_CACHE_TTL_MS;
+    return snapshot;
+  } catch (error) {
+    if (messagePolicyCache.get(userId) === entry) messagePolicyCache.delete(userId);
+    throw error;
+  }
+}
+
+/**
+ * Enforce message expiry on the authenticated WebSocket path as well as HTTP.
+ * WebSocket chat sends bypass /api/messages, so relying on its Express
+ * middleware alone allows a logged-in socket to keep sending after expiry.
+ * Use the same persisted state and usage row as server.cloudflare.ts.
+ */
+async function assertRealtimeMessagingAllowed(env: Env, userId: UserId): Promise<void> {
+  let appState: any;
+  let usage: any;
+  try {
+    const snapshot = await readMessagePolicySnapshot(env, userId);
+    appState = snapshot.appState;
+    usage = snapshot.usage;
   } catch (error) {
     console.error('SYNAX realtime message time check failed:', error);
     throw new RealtimeMessagePolicyError(
@@ -151,7 +191,6 @@ async function assertRealtimeMessagingAllowed(env: Env, userId: UserId): Promise
       'Unable to verify your remaining SYNAX time. Please try again shortly.',
     );
   }
-
   if (!appState || !appState.users?.[userId] || !usage) {
     // Fail closed: never let a connected socket bypass the expiry policy just
     // because the authoritative state could not be read.
@@ -216,8 +255,10 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
 
     // Keep a short cache to avoid hitting Supabase on every heartbeat, but
     // refresh it periodically and retry writes that previously failed.
-    if (cached > 0 && !dirty && Date.now() - checkedAt < 5_000) {
-      this.lastSeenMemory.set(userId, cached);
+    // Cache missing/null last-seen values too. Otherwise users whose row has
+    // no last_seen timestamp trigger Supabase reads on every heartbeat.
+    if (!dirty && checkedAt > 0 && Date.now() - checkedAt < 5_000) {
+      if (cached > 0) this.lastSeenMemory.set(userId, cached);
       return cached;
     }
 
@@ -550,7 +591,13 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       message: canonical,
     });
     for (const socket of this.getAuthenticatedSockets()) {
-      try { socket.send(serialized); } catch {}
+      try {
+        socket.send(serialized);
+      } catch {
+        // A failed write should not leave a dead socket looking like a valid
+        // delivery path. Closing it makes the client reconnect and reconcile.
+        try { socket.close(1011, 'Realtime message delivery failed'); } catch {}
+      }
     }
 
     return {
@@ -919,6 +966,13 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
           this.broadcastPresence(),
         ];
         if (isUserId(session.userId)) {
+          // Warm the short-lived policy cache while the socket is authenticating,
+          // rather than making the first chat message wait for two REST reads.
+          backgroundTasks.push(
+            readMessagePolicySnapshot(this.env, session.userId)
+              .then(() => undefined)
+              .catch((error) => { console.warn('SYNAX message-policy prewarm failed:', error); }),
+          );
           backgroundTasks.push(this.markPartnerMessagesDelivered(session.userId));
         }
         this.ctx.waitUntil(Promise.allSettled(backgroundTasks));
@@ -962,6 +1016,18 @@ export class SynaxRealtimeHub extends DurableObject<Env> {
       const now = Date.now();
       const lastActiveAt = active ? now : (info.lastActiveAt || now);
       ws.serializeAttachment({ ...info, chatActive: active, lastHeartbeat: now, lastActiveAt });
+      // Reply on this socket immediately; the full presence snapshot can take
+      // longer because it also reconciles last-seen values in the database.
+      try { ws.send(JSON.stringify({ type: 'presence:heartbeat_ack', timestamp: now })); } catch {}
+      if (active && isUserId(info.userId)) {
+        // Refresh policy data from the heartbeat path in the background. This
+        // keeps normal sends fast while expiry is still recalculated per send.
+        this.ctx.waitUntil(
+          readMessagePolicySnapshot(this.env, info.userId)
+            .then(() => undefined)
+            .catch((error) => { console.warn('SYNAX message-policy refresh failed:', error); }),
+        );
+      }
       if (!active && wasActive) {
         const anotherActiveSocket = this.isUserChatActive(info.userId, ws);
         if (!anotherActiveSocket) await this.setLastSeen(info.userId, lastActiveAt);
