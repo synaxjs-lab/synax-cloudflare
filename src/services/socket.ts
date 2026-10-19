@@ -35,6 +35,9 @@ class SocketService {
   private callSignalSince = 0;
   private visibilityHandler: (() => void) | null = null;
   private pendingCallEvents = new Map<string, any[]>();
+  // Preserve incoming chat events briefly if the socket receives one during a
+  // React transition before ChatRoom has attached its event listener.
+  private pendingChatMessages: any[] = [];
   private seenCallSignalIds = new Set<number>();
 
   connect(token: string) {
@@ -530,6 +533,13 @@ class SocketService {
       try { callback(this.lastPresenceEvent); } catch (error) { console.error(error); }
     }
 
+    if (event === 'chat:new_message' && this.pendingChatMessages.length) {
+      const pending = this.pendingChatMessages.splice(0, this.pendingChatMessages.length);
+      for (const payload of pending) {
+        try { callback(payload); } catch (error) { console.error('SYNAX buffered chat message listener error:', error); }
+      }
+    }
+
     if (event.startsWith('call:')) {
       const pending = this.pendingCallEvents.get(event);
       if (pending?.length) {
@@ -560,6 +570,15 @@ class SocketService {
       return;
     }
 
+    if (event === 'chat:new_message' && data?.message) {
+      // Store only events that arrived while no chat listener existed. Normal
+      // events are dispatched once and aren't replayed to active listeners.
+      this.pendingChatMessages.push(data);
+      if (this.pendingChatMessages.length > 100) {
+        this.pendingChatMessages.splice(0, this.pendingChatMessages.length - 100);
+      }
+    }
+
     if (event.startsWith('call:')) {
       const pending = this.pendingCallEvents.get(event) || [];
       pending.push(data);
@@ -580,6 +599,7 @@ class SocketService {
       this.authTimeoutTimer = null;
     }
     this.pendingCallEvents.clear();
+    this.pendingChatMessages = [];
     this.seenCallSignalIds.clear();
     this.token = null;
     this.authenticated = false;
