@@ -1549,7 +1549,7 @@ async function recordCallChatEvent(params: {
   return persisted;
 }
 
-async function loadPendingMessagesFromRealtime(): Promise<any[]> {
+async function loadPendingMessagesFromRealtime(timeoutMs = 4000): Promise<any[]> {
   const binding = cloudflareEnv?.SYNAX_REALTIME_HUB;
   // Local Node development has no Durable Object binding. In production the
   // binding is required, and if it exists but is unreachable we must not hide
@@ -1560,7 +1560,7 @@ async function loadPendingMessagesFromRealtime(): Promise<any[]> {
   const response = await stub.fetch(new Request('https://synax.internal/pending-messages', {
     method: 'GET',
     headers: { 'Cache-Control': 'no-cache' },
-    signal: AbortSignal.timeout(4000),
+    signal: AbortSignal.timeout(timeoutMs),
   }));
   if (!response.ok) {
     throw new Error(`Realtime pending-message queue returned HTTP ${response.status}.`);
@@ -2292,6 +2292,59 @@ export async function createCloudflareHttpServer() {
       console.error('Failed to reset shared chat background:', err);
       res.status(503).json({ error: 'Unable to reset chat background.' });
     }
+  });
+
+  // Small recovery endpoint used while the chat is open. The WebSocket remains
+  // the fast path; this only retrieves the recent window so a missed event is
+  // repaired without repeatedly downloading the entire conversation history.
+  app.get('/api/messages/recent', requireUserAuth, async (req: Request, res: Response) => {
+    const now = Date.now();
+    const requestedSince = Number(req.query.since);
+    // Keep a 15-second overlap for delayed persistence/clock skew, but bound
+    // the range so this endpoint cannot accidentally scan the full history.
+    const since = Number.isFinite(requestedSince) && requestedSince > 0
+      ? Math.max(now - 120_000, Math.min(requestedSince, now) - 15_000)
+      : now - 60_000;
+
+    const select = 'id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted';
+    const path = `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=${select}` +
+      `&timestamp=gte.${Math.floor(since)}&order=timestamp.asc,id.asc&limit=250`;
+
+    const [canonicalResult, pendingResult] = await Promise.allSettled([
+      supabaseFetch(path, {
+        headers: { 'Cache-Control': 'no-cache' },
+        signal: AbortSignal.timeout(3000),
+      })
+        .then(async (response) => {
+          const rows = await response.json() as SupabaseMessageRow[];
+          if (!Array.isArray(rows)) throw new Error('Supabase returned an invalid recent-message response.');
+          return rows.map(rowToChatMessage);
+        }),
+      // The Durable Object queue is the source of truth for messages that have
+      // been accepted but are still waiting for Supabase persistence. Keep this
+      // best-effort and bounded so an unhealthy realtime request never blocks
+      // already-persisted recent messages.
+      loadPendingMessagesFromRealtime(900).catch(() => []),
+    ]);
+
+    const canonical = canonicalResult.status === 'fulfilled' ? canonicalResult.value : [];
+    const pending = pendingResult.status === 'fulfilled'
+      ? pendingResult.value.filter((message: any) => Number(message?.timestamp || 0) >= since)
+      : [];
+
+    if (canonicalResult.status === 'rejected' && pending.length === 0) {
+      console.warn('SYNAX recent-message recovery failed:', canonicalResult.reason);
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.status(503).json({
+        error: 'Recent message recovery is temporarily unavailable.',
+        detail: canonicalResult.reason instanceof Error ? canonicalResult.reason.message : String(canonicalResult.reason),
+      });
+      return;
+    }
+
+    const messages = mergePendingMessages(canonical, pending);
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.json({ messages, serverTime: now });
   });
 
   // Get messages from the canonical Supabase chat table. This avoids the
