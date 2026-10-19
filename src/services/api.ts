@@ -472,17 +472,47 @@ export const ApiService = {
 
   async getMessages(): Promise<ChatMessage[]> {
     const token = ApiService.getToken();
-    const res = await apiFetch('/api/messages', {
-      headers: { Authorization: `Bearer ${token}` },
-      cache: 'no-store',
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      const message = data.detail ? `${data.error || 'Failed to fetch messages'}: ${data.detail}` : (data.error || 'Failed to fetch messages');
-      throw new Error(message);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await apiFetch('/api/messages', {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const message = data.detail ? `${data.error || 'Failed to fetch messages'}: ${data.detail}` : (data.error || 'Failed to fetch messages');
+        throw new Error(message);
+      }
+      if (!Array.isArray(data.messages)) throw new Error('Message history API returned an invalid response.');
+      return data.messages;
+    } finally {
+      window.clearTimeout(timeout);
     }
-    if (!Array.isArray(data.messages)) throw new Error('Message history API returned an invalid response.');
-    return data.messages;
+  },
+
+  // Lightweight live-delivery safety net. Unlike getMessages(), this only
+  // downloads a recent time window, allowing ChatRoom to recover missed
+  // WebSocket events without repeatedly fetching the entire conversation.
+  async getRecentMessages(): Promise<ChatMessage[]> {
+    const token = ApiService.getToken();
+    const since = Math.max(0, Date.now() - 60_000);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 4500);
+    try {
+      const res = await apiFetch(`/api/messages/recent?since=${since}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      const data = await readApiJson<any>(res);
+      if (!res.ok) throw new Error(apiErrorFromResponse(data, res.status));
+      if (!Array.isArray(data?.messages)) throw new Error('Recent message recovery returned an invalid response.');
+      return data.messages as ChatMessage[];
+    } finally {
+      window.clearTimeout(timeout);
+    }
   },
 
   async markMessagesAsRead(messageIds?: string[]): Promise<void> {
@@ -574,12 +604,12 @@ export const ApiService = {
 
     // POST is made idempotent by clientMessageId on the server, so a network
     // retry cannot create a duplicate message after a lost response.
-    const maxAttempts = payload.clientMessageId ? 3 : 1;
+    const maxAttempts = payload.clientMessageId ? 2 : 1;
     let lastError: unknown = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), 12000);
+      const timer = window.setTimeout(() => controller.abort(), 8000);
       try {
         const res = await apiFetch('/api/messages', {
           method: 'POST',
