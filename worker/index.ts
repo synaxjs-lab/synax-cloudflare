@@ -9,6 +9,9 @@ interface Env {
   SYNAX_REALTIME_HUB: DurableObjectNamespace;
   SUPABASE_URL: string;
   SUPABASE_SECRET_KEY: string;
+  // Cloudflare TURN credentials must be stored as Worker Secrets.
+  CLOUDFLARE_TURN_KEY_ID?: string;
+  CLOUDFLARE_TURN_API_TOKEN?: string;
 }
 
 let serverPromise: Promise<import('node:http').Server> | null = null;
