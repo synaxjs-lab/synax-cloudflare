@@ -11,8 +11,9 @@ import {
   Minimize2,
   AlertCircle,
   Volume2,
+  SwitchCamera,
 } from 'lucide-react';
-import { WebRTCManager } from '../services/webrtc';
+import { WebRTCManager, requestCallMedia } from '../services/webrtc';
 import { SoundEffects } from '../services/sound';
 import { socketService } from '../services/socket';
 
@@ -44,6 +45,8 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
   const [hasError, setHasError] = useState<string | null>(callState.initialError || null);
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [isAccepting, setIsAccepting] = useState(false);
+  const [isSwitchingCamera, setIsSwitchingCamera] = useState(false);
+  const [turnRelayAvailable, setTurnRelayAvailable] = useState<boolean | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -53,6 +56,9 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
   const localStreamRef = useRef<MediaStream | null>(callState.localStream || null);
   const closeRef = useRef(onClose);
   const endedRef = useRef(false);
+  const recoveryTimerRef = useRef<number | null>(null);
+  const restartAttemptsRef = useRef(0);
+  const restartInFlightRef = useRef(false);
 
   closeRef.current = onClose;
 
@@ -91,6 +97,73 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
     });
   };
 
+  const clearRecoveryTimer = () => {
+    if (recoveryTimerRef.current !== null) {
+      window.clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
+    }
+  };
+
+  const attemptIceRestart = async () => {
+    if (endedRef.current || callState.role !== 'caller' || restartInFlightRef.current) return;
+    if (rtcRef.current?.getConnectionState() === 'connected') {
+      clearRecoveryTimer();
+      restartAttemptsRef.current = 0;
+      return;
+    }
+    if (restartAttemptsRef.current >= 2) {
+      finish('Connection lost', 'The network changed and the call could not reconnect. Please start a new call.');
+      window.setTimeout(() => closeRef.current(), 1400);
+      return;
+    }
+
+    restartAttemptsRef.current += 1;
+    restartInFlightRef.current = true;
+    setConnectionMessage(`Restoring call connection (${restartAttemptsRef.current}/2)…`);
+    try {
+      const offer = await rtcRef.current?.createIceRestartOffer();
+      if (!offer) throw new Error('The call is still negotiating; retrying shortly.');
+      const sent = await socketService.sendCallSignal({
+        callId: callState.callId,
+        type: 'call:ice-restart-offer',
+        callType: callState.callType,
+        sdp: offer,
+      });
+      if (!sent) throw new Error('The network did not accept the reconnection request.');
+      if (rtcRef.current?.getConnectionState() === 'connected') return;
+      clearRecoveryTimer();
+      recoveryTimerRef.current = window.setTimeout(() => {
+        recoveryTimerRef.current = null;
+        if (!endedRef.current && rtcRef.current?.getConnectionState() !== 'connected') void attemptIceRestart();
+      }, 9000);
+    } catch (error) {
+      console.warn('SYNAX ICE restart attempt failed:', error);
+      if (restartAttemptsRef.current < 2) {
+        clearRecoveryTimer();
+        recoveryTimerRef.current = window.setTimeout(() => {
+          recoveryTimerRef.current = null;
+          void attemptIceRestart();
+        }, 2500);
+      } else {
+        finish('Connection lost', error instanceof Error ? error.message : 'The call could not reconnect. Please start a new call.');
+        window.setTimeout(() => closeRef.current(), 1400);
+      }
+    } finally {
+      restartInFlightRef.current = false;
+    }
+  };
+
+  const scheduleIceRecovery = () => {
+    if (endedRef.current) return;
+    setStatus((current) => current === 'ended' ? current : 'connecting');
+    setConnectionMessage('Connection interrupted… trying to reconnect…');
+    if (callState.role !== 'caller' || recoveryTimerRef.current !== null) return;
+    recoveryTimerRef.current = window.setTimeout(() => {
+      recoveryTimerRef.current = null;
+      void attemptIceRestart();
+    }, 3500);
+  };
+
   useEffect(() => {
     const rtc = new WebRTCManager();
     rtcRef.current = rtc;
@@ -104,9 +177,14 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
       });
     };
 
+    rtc.onIceServerStatus = (turnAvailable) => setTurnRelayAvailable(turnAvailable);
+
     rtc.onRemoteStream = (stream) => {
       if (callState.callType === 'video' && remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = stream;
+        // The separate audio element plays sound. Muting this video element avoids
+        // duplicate remote audio on Android mobile browsers.
+        remoteVideoRef.current.muted = true;
         void remoteVideoRef.current.play().catch(() => undefined);
       }
 
@@ -125,6 +203,8 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
     rtc.onConnectionState = (state) => {
       if (endedRef.current) return;
       if (state === 'connected') {
+        clearRecoveryTimer();
+        restartAttemptsRef.current = 0;
         setHasError(null);
         setStatus('connected');
         setConnectionMessage('Connected');
@@ -135,17 +215,12 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
         setConnectionMessage('Connecting securely…');
         return;
       }
-      if (state === 'disconnected') {
-        setConnectionMessage('Connection interrupted… reconnecting…');
+      if (state === 'disconnected' || state === 'failed') {
+        scheduleIceRecovery();
         return;
       }
-      if (state === 'failed') {
-        endSignal();
-        finish('Connection failed', 'The devices could not establish the WebRTC connection.');
-        return;
-      }
-      if (state === 'closed') {
-        if (status !== 'ended') finish('Call ended');
+      if (state === 'closed' && !endedRef.current) {
+        finish('Call ended');
       }
     };
 
@@ -177,10 +252,41 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
     });
 
     const unsubError = socketService.on('call:error', (data) => {
-      // Only react to errors while this call is active.
       if (endedRef.current) return;
+      if (data?.callId && data.callId !== callState.callId) return;
+      if (data?.fatal === false) return;
       finish('Call failed', data?.error || 'SYNAX call signaling failed.');
       window.setTimeout(() => closeRef.current(), 1500);
+    });
+
+    const unsubRestartOffer = socketService.on('call:ice-restart-offer', async (data) => {
+      if (data?.callId !== callState.callId || endedRef.current) return;
+      const stream = localStreamRef.current;
+      if (!stream) return;
+      try {
+        setConnectionMessage('Negotiating a new network route…');
+        const answer = await rtc.handleIceRestartOffer(data.sdp);
+        const sent = await socketService.sendCallSignal({
+          callId: callState.callId,
+          type: 'call:ice-restart-answer',
+          callType: callState.callType,
+          sdp: answer,
+        });
+        if (!sent) setConnectionMessage('Reconnection response could not be sent; retrying…');
+      } catch (error) {
+        console.warn('SYNAX restart offer could not be applied:', error);
+        setConnectionMessage('Still reconnecting…');
+      }
+    });
+
+    const unsubRestartAnswer = socketService.on('call:ice-restart-answer', async (data) => {
+      if (data?.callId !== callState.callId || endedRef.current || !data?.sdp) return;
+      try {
+        await rtc.handleAnswer(data.sdp);
+      } catch (error) {
+        console.warn('SYNAX restart answer could not be applied:', error);
+        scheduleIceRecovery();
+      }
     });
 
     const startCaller = async () => {
@@ -209,19 +315,37 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
       }
     };
 
-    if (callState.role === 'caller') void startCaller();
+    if (callState.role === 'caller' && callState.status !== 'ended' && !callState.initialError) void startCaller();
 
     return () => {
+      clearRecoveryTimer();
       unsubAnswer();
       unsubCandidate();
       unsubReject();
       unsubEnd();
       unsubError();
+      unsubRestartOffer();
+      unsubRestartAnswer();
       rtc.cleanup();
+      localStreamRef.current?.getTracks().forEach((track) => { try { track.stop(); } catch {} });
+      localStreamRef.current = null;
     };
     // This component is one call session; do not recreate the peer connection on render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Stop camera/microphone promptly after end/decline/failure rather than
+  // waiting for the modal's delayed close animation to unmount.
+  useEffect(() => {
+    if (status !== 'ended') return;
+    clearRecoveryTimer();
+    rtcRef.current?.cleanup();
+    localStreamRef.current?.getTracks().forEach((track) => { try { track.stop(); } catch {} });
+    localStreamRef.current = null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+  }, [status]);
 
   // Caller timeout and callee ringing timeout.
   useEffect(() => {
@@ -238,53 +362,64 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
   const handleAcceptCall = async () => {
     if (isAccepting || endedRef.current) return;
     setIsAccepting(true);
+    let acquiredStream: MediaStream | null = null;
     try {
+      if (callState.status === 'ended') throw new Error('This call has already ended. Ask the other person to call again.');
+
+      // IMPORTANT on mobile: start the permission prompt directly from this user
+      // gesture. Do not wait on the network before requesting microphone/camera.
+      setConnectionMessage(callState.callType === 'video' ? 'Requesting camera and microphone…' : 'Requesting microphone…');
+      acquiredStream = await requestCallMedia(callState.callType);
+      localStreamRef.current = acquiredStream;
+      if (callState.callType === 'video' && localVideoRef.current) {
+        localVideoRef.current.srcObject = acquiredStream;
+        localVideoRef.current.muted = true;
+        void localVideoRef.current.play().catch(() => undefined);
+      }
+
       let offerSdp = callState.offerSdp;
       if (!offerSdp) {
-        setConnectionMessage('Recovering secure call offer…');
-        for (let attempt = 0; attempt < 5 && !offerSdp; attempt++) {
+        setConnectionMessage('Recovering the call invitation…');
+        for (let attempt = 0; attempt < 3 && !offerSdp; attempt++) {
           offerSdp = (await socketService.getCallOffer(callState.callId))?.sdp;
-          if (!offerSdp) await new Promise((resolve) => window.setTimeout(resolve, 300));
+          if (!offerSdp && attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250));
         }
       }
-      if (!offerSdp) throw new Error('The call offer is unavailable. Please start the call again.');
+      if (!offerSdp) throw new Error('The call invitation could not be recovered. Ask the other person to call again.');
+      if (endedRef.current) throw new Error('The other person ended the call.');
+      if (!rtcRef.current) throw new Error('The WebRTC engine is not ready. Close the call and retry.');
 
-      setConnectionMessage('Accessing microphone…');
-      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-        throw new Error('Camera and microphone access requires a secure browser connection.');
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: callState.callType === 'video',
-      });
-
-      localStreamRef.current = stream;
-      if (callState.callType === 'video' && localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-
-      if (!rtcRef.current) throw new Error('WebRTC engine is not ready.');
       setConnectionMessage('Creating secure connection…');
       const answer = await rtcRef.current.handleOfferAndCreateAnswer(
         offerSdp,
         callState.callType,
-        stream,
+        acquiredStream,
       );
-
       const sent = await socketService.sendCallSignal({
         callId: callState.callId,
         type: 'call:answer',
         callType: callState.callType,
         sdp: answer,
       });
-      if (!sent) throw new Error('Your answer could not be delivered to the caller.');
+      if (!sent) throw new Error('Your answer could not reach the caller. Check the connection and retry the call.');
 
       setStatus('connecting');
       setConnectionMessage('Connecting securely…');
     } catch (error: any) {
       console.error('SYNAX accept failed:', error);
-      setHasError(error?.message || 'Microphone/camera permission failed.');
+      // Release a stream if setup failed before WebRTC took ownership of it.
+      const peerOwnsStream = Boolean(acquiredStream && rtcRef.current?.getLocalStream() === acquiredStream);
+      if (acquiredStream && !peerOwnsStream) {
+        acquiredStream.getTracks().forEach((track) => { try { track.stop(); } catch {} });
+      }
+      if (localStreamRef.current === acquiredStream) localStreamRef.current = null;
+      setHasError(error?.message || 'The call could not be accepted. Check microphone/camera permission and try again.');
       setConnectionMessage('Call could not connect');
+      if (peerOwnsStream) {
+        endSignal();
+        finish('Call failed', error?.message || 'The connection could not be negotiated. Start a new call and try again.');
+        window.setTimeout(() => closeRef.current(), 1600);
+      }
     } finally {
       setIsAccepting(false);
     }
@@ -333,6 +468,23 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
     rtcRef.current?.toggleCamera(next);
   };
 
+  const handleSwitchCamera = async () => {
+    if (isSwitchingCamera || endedRef.current || !rtcRef.current) return;
+    setIsSwitchingCamera(true);
+    try {
+      const switched = await rtcRef.current.switchCamera();
+      if (switched && localVideoRef.current) {
+        localVideoRef.current.srcObject = rtcRef.current.getLocalStream();
+        localVideoRef.current.muted = true;
+        void localVideoRef.current.play().catch(() => undefined);
+      } else {
+        setHasError('Camera switching is not available in this browser/device. The current camera remains active.');
+      }
+    } finally {
+      setIsSwitchingCamera(false);
+    }
+  };
+
   const toggleFullscreen = () => {
     const container = containerRef.current;
     if (!container) return;
@@ -379,7 +531,7 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
         <div className="relative flex-1 w-full h-full flex items-center justify-center bg-[#07090e] overflow-hidden">
           {callState.callType === 'video' ? (
             <>
-              <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
+              <video ref={remoteVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
               {status !== 'connected' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 gap-4">
                   <div className="relative">
@@ -426,12 +578,17 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
                   <span>{hasError}</span>
                 </div>
               )}
-              {audioBlocked && (
-                <button type="button" onClick={enableAudio} className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold border border-indigo-400/40">
-                  <Volume2 className="w-4 h-4" />
-                  Enable Speaker Audio
-                </button>
-              )}
+            </div>
+          )}
+          {audioBlocked && (
+            <button type="button" onClick={enableAudio} className="absolute bottom-20 sm:bottom-24 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold border border-indigo-400/40 shadow-lg">
+              <Volume2 className="w-4 h-4" />
+              Tap to enable speaker audio
+            </button>
+          )}
+          {turnRelayAvailable === false && status !== 'connected' && status !== 'ended' && (
+            <div className="absolute top-20 left-3 right-3 sm:left-auto sm:right-4 sm:max-w-sm z-20 rounded-xl border border-amber-500/30 bg-amber-950/80 px-3 py-2 text-[11px] leading-relaxed text-amber-100">
+              TURN relay is not configured. Calls may fail on some mobile-carrier or restricted Wi-Fi networks. The site admin needs to configure the Cloudflare TURN secrets.
             </div>
           )}
         </div>
@@ -454,9 +611,14 @@ export const CallModal: React.FC<CallModalProps> = ({ callState, onClose }) => {
                 {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
               </button>
               {callState.callType === 'video' && (
-                <button type="button" onClick={toggleVideo} className={`p-3.5 rounded-2xl border transition-all ${isVideoOff ? 'bg-red-600/80 border-red-500 text-white' : 'bg-slate-900/80 border-slate-700 text-slate-200 hover:bg-slate-800'}`} title={isVideoOff ? 'Turn on camera' : 'Turn off camera'}>
-                  {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
-                </button>
+                <>
+                  <button type="button" onClick={toggleVideo} className={`p-3.5 rounded-2xl border transition-all ${isVideoOff ? 'bg-red-600/80 border-red-500 text-white' : 'bg-slate-900/80 border-slate-700 text-slate-200 hover:bg-slate-800'}`} title={isVideoOff ? 'Turn on camera' : 'Turn off camera'}>
+                    {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+                  </button>
+                  <button type="button" onClick={handleSwitchCamera} disabled={isSwitchingCamera} className="p-3.5 rounded-2xl border bg-slate-900/80 border-slate-700 text-slate-200 hover:bg-slate-800 disabled:opacity-50" title="Switch front/rear camera">
+                    <SwitchCamera className="w-5 h-5" />
+                  </button>
+                </>
               )}
               <button type="button" onClick={handleEndCall} className="px-6 py-3.5 rounded-2xl bg-red-600 hover:bg-red-500 text-white font-semibold text-xs uppercase tracking-wider shadow-[0_0_25px_rgba(239,68,68,0.4)] flex items-center gap-2 active:scale-95 transition-all">
                 <PhoneOff className="w-5 h-5" />
