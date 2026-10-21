@@ -264,22 +264,6 @@ export function configureCloudflareRuntime(env: any, ctx: any) {
 
   SUPABASE_SERVICE_ROLE_KEY = configuredKey;
 }
-
-// Public STUN is a compatibility fallback only. STUN cannot relay media through
-// every mobile-carrier NAT; production calling should have the server-side TURN
-// secrets configured in the Cloudflare Worker dashboard.
-const FALLBACK_ICE_SERVERS: Array<{ urls: string | string[] }> = [
-  { urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] },
-];
-
-function getConfiguredTurnKeyId(): string {
-  return String(cloudflareEnv?.CLOUDFLARE_TURN_KEY_ID || '').trim();
-}
-
-function getConfiguredTurnApiToken(): string {
-  return String(cloudflareEnv?.CLOUDFLARE_TURN_API_TOKEN || '').trim();
-}
-
 const SUPABASE_STATE_TABLE = 'synax_state';
 const SUPABASE_STATE_ID = 'main';
 const SUPABASE_SESSIONS_TABLE = 'synax_sessions';
@@ -294,6 +278,7 @@ const useSupabase = true;
 
 let db: DbSchema;
 let persistenceQueue: Promise<void> = Promise.resolve();
+let lastPersistenceError: unknown = null;
 let lastRemoteSync = 0;
 let stateRefreshInFlight: Promise<void> | null = null;
 const STATE_REFRESH_TTL_MS = 10000;
@@ -305,7 +290,6 @@ const sessionCache = new Map<string, { session: DbSchema['sessions'][string]; ex
 // Keep the app functional in that situation and fall back to the canonical
 // synax_state document until the table is available.
 let sessionsTableAvailable: boolean | null = null;
-let messagesTableAvailable: boolean | null = null;
 let usageTableAvailable: boolean | null = null;
 let usageCheckpointRpcAvailable: boolean | null = null;
 
@@ -494,258 +478,154 @@ function chatMessageToRow(message: any, clientMessageId?: string | null): Supaba
 }
 
 async function loadMessagesFromSupabase(): Promise<any[]> {
-  const pending = await loadPendingMessagesFromRealtime();
+  // Supabase is the canonical long-term message history. The Durable Object
+  // queue only supplements rows which have not reached Supabase yet.
+  // IMPORTANT: a failed Durable Object queue read must NOT block canonical
+  // history. Previously that read ran before the try/catch, so one unhealthy
+  // realtime request caused GET /api/messages to fail even while Supabase had
+  // the messages. That made messages appear to vanish after refresh.
+  let pending: any[] = [];
   try {
-    // Do not trust the per-isolate negative table cache for chat history. A
-    // previous request may have hit a stale PostgREST schema cache; if we
-    // short-circuit here, this isolate can serve stale in-memory history for
-    // its entire lifetime even after the table becomes available.
-    // PostgREST may cap rows per response, so page through the newest canonical
-    // history in bounded batches instead of asking for 5,000 rows in one call.
-    const pageSize = 1000;
-    const maxHistoryRows = 5000;
-    const rows: SupabaseMessageRow[] = [];
-    for (let offset = 0; offset < maxHistoryRows; offset += pageSize) {
-      const res = await supabaseFetch(
-        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&order=timestamp.asc,id.asc&limit=${pageSize}&offset=${offset}`
-      );
-      const page = await res.json() as SupabaseMessageRow[];
-      if (!Array.isArray(page)) throw new Error('Supabase returned an invalid message history response.');
+    pending = await loadPendingMessagesFromRealtime();
+  } catch (error) {
+    console.warn(
+      'SYNAX realtime pending queue unavailable; continuing with Supabase message history:',
+      error,
+    );
+  }
+
+  const pageSize = 1000;
+  const rows: SupabaseMessageRow[] = [];
+  try {
+    // Read every page rather than silently truncating history at 5,000 rows.
+    // PostgREST commonly caps a response at 1,000 rows. Request newest-first,
+    // then restore chronological order before returning to the chat UI.
+    for (let offset = 0; ; offset += pageSize) {
+      const path =
+        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted` +
+        `&order=timestamp.desc,id.desc&limit=${pageSize}&offset=${offset}`;
+      const response = await supabaseFetch(path, {
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      const page = await response.json() as SupabaseMessageRow[];
+      if (!Array.isArray(page)) {
+        throw new Error('Supabase returned an invalid message history response.');
+      }
       rows.push(...page);
       if (page.length < pageSize) break;
     }
-
-    messagesTableAvailable = true;
-    let messages = rows.map(rowToChatMessage);
-    if (messages.length === 0 && Array.isArray(db?.messages) && db.messages.length > 0) {
-      // Seed lazily on the first history request instead of during startup.
-      messages = await ensureMessagesTableSeed(db.messages);
-    }
-    return mergePendingMessages(messages, pending);
   } catch (error) {
     if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return mergePendingMessages(db.messages || [], pending);
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Canonical chat history public.${SUPABASE_MESSAGES_TABLE} is not accessible through the Supabase Data API. ` +
+        `Check Data API exposure, the server-side key/permissions, and the PostgREST schema cache. Details: ${detail}`
+      );
     }
-    // Do not silently replace canonical history with a stale isolate snapshot
-    // on transient auth/network/API failures. Surface a 503 so logs show the
-    // real cause and the client can retain its current messages on screen.
     console.error('SYNAX canonical message history fetch failed:', error);
     throw error;
   }
+
+  // Client retries and Durable Object pending entries may overlap with rows
+  // already committed to Supabase. Deduplicate by client ID first, then row ID.
+  const unique = new Map<string, SupabaseMessageRow>();
+  for (const row of rows) {
+    const key = String(row.client_message_id || row.id || '');
+    if (key && !unique.has(key)) unique.set(key, row);
+  }
+  const messages = Array.from(unique.values())
+    .map(rowToChatMessage)
+    .sort((a: any, b: any) =>
+      Number(a.timestamp) - Number(b.timestamp) || String(a.id).localeCompare(String(b.id))
+    );
+
+  return mergePendingMessages(messages, pending);
 }
 
 async function findMessageById(id: string): Promise<any | null> {
-  if (messagesTableAvailable === false) {
-    return (db.messages || []).find((message: any) => String(message.id) === String(id)) || null;
-  }
-  try {
-    const res = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`
-    );
-    const rows = await res.json() as SupabaseMessageRow[];
-    messagesTableAvailable = true;
-    return rows[0] ? rowToChatMessage(rows[0]) : null;
-  } catch (error) {
-    if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return (db.messages || []).find((message: any) => String(message.id) === String(id)) || null;
-    }
-    throw error;
-  }
+  const res = await supabaseFetch(
+    `/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`,
+    { headers: { 'Cache-Control': 'no-cache' } },
+  );
+  const rows = await res.json() as SupabaseMessageRow[];
+  return rows[0] ? rowToChatMessage(rows[0]) : null;
 }
 
 async function findMessageByClientId(clientMessageId: string): Promise<any | null> {
-  if (messagesTableAvailable === false) {
-    return (db.messages || []).find((message: any) => String(message.clientMessageId || '') === String(clientMessageId)) || null;
-  }
-  try {
-    const res = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?client_message_id=eq.${encodeURIComponent(clientMessageId)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`
-    );
-    const rows = await res.json() as SupabaseMessageRow[];
-    messagesTableAvailable = true;
-    return rows[0] ? rowToChatMessage(rows[0]) : null;
-  } catch (error) {
-    if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return (db.messages || []).find((message: any) => String(message.clientMessageId || '') === String(clientMessageId)) || null;
-    }
-    throw error;
-  }
+  const res = await supabaseFetch(
+    `/rest/v1/${SUPABASE_MESSAGES_TABLE}?client_message_id=eq.${encodeURIComponent(clientMessageId)}&select=id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted&limit=1`,
+    { headers: { 'Cache-Control': 'no-cache' } },
+  );
+  const rows = await res.json() as SupabaseMessageRow[];
+  return rows[0] ? rowToChatMessage(rows[0]) : null;
 }
 
 async function insertMessageToSupabase(message: any, clientMessageId?: string | null): Promise<any> {
-  if (messagesTableAvailable === false) {
-    const existing = clientMessageId ? await findMessageByClientId(String(clientMessageId)) : null;
-    if (existing) return existing;
-    const next = [...(db.messages || []), { ...message, clientMessageId: clientMessageId || message.clientMessageId }];
-    db.messages = next.slice(-5000);
-    await saveDbSyncStrict();
-    return message;
-  }
-
   const row = chatMessageToRow(message, clientMessageId);
   const useIdempotency = Boolean(clientMessageId);
-  // client_message_id deduplicates normal user messages; idempotency on the
-  // primary key also protects system/call messages and concurrent retries.
   const path = useIdempotency
     ? `/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=client_message_id`
     : `/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=id`;
-  try {
-    const res = await supabaseFetch(path, {
-      method: 'POST',
-      headers: {
-        Prefer: 'resolution=ignore-duplicates,return=representation',
-      },
-      body: JSON.stringify(row),
-    });
-    messagesTableAvailable = true;
-    const rows = await res.json().catch(() => []);
-    if (Array.isArray(rows) && rows[0]) return rowToChatMessage(rows[0]);
-    if (useIdempotency) {
-      const existing = await findMessageByClientId(String(clientMessageId));
-      if (existing) return existing;
-    } else {
-      const existing = await findMessageById(String(message.id));
-      if (existing) return existing;
-    }
-    return message;
-  } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    const existing = clientMessageId ? await findMessageByClientId(String(clientMessageId)) : null;
-    if (existing) return existing;
-    db.messages = [...(db.messages || []), { ...message, clientMessageId: clientMessageId || message.clientMessageId }].slice(-5000);
-    await saveDbSyncStrict();
-    return message;
-  }
+
+  const res = await supabaseFetch(path, {
+    method: 'POST',
+    headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
+    body: JSON.stringify(row),
+  });
+  const rows = await res.json().catch(() => []);
+  if (Array.isArray(rows) && rows[0]) return rowToChatMessage(rows[0]);
+
+  // A safe idempotent retry can be ignored by Postgres because the row already
+  // exists. Confirm that canonical row before reporting the message as saved.
+  const existing = useIdempotency
+    ? await findMessageByClientId(String(clientMessageId))
+    : await findMessageById(String(message.id));
+  if (existing) return existing;
+  throw new Error('Supabase did not return or confirm the saved chat message.');
 }
 
 async function updateMessageInSupabase(id: string, patch: Record<string, unknown>): Promise<any | null> {
-  if (messagesTableAvailable === false) {
-    const index = (db.messages || []).findIndex((message: any) => String(message.id) === String(id));
-    if (index < 0) return null;
-    const updated = { ...db.messages[index], ...patch };
-    if ('file_url' in patch) updated.fileUrl = patch.file_url;
-    if ('is_pinned' in patch) updated.isPinned = patch.is_pinned;
-    if ('is_edited' in patch) updated.isEdited = patch.is_edited;
-    if ('deleted' in patch) updated.deleted = patch.deleted;
-    db.messages[index] = updated;
-    await saveDbSync();
-    return updated;
-  }
-  try {
-    const res = await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { Prefer: 'return=representation' },
-      body: JSON.stringify(patch),
-    });
-    messagesTableAvailable = true;
-    const rows = await res.json().catch(() => []);
-    return Array.isArray(rows) && rows[0] ? rowToChatMessage(rows[0]) : null;
-  } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    return updateMessageInSupabase(id, patch);
-  }
+  const res = await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=eq.${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify(patch),
+  });
+  const rows = await res.json().catch(() => []);
+  return Array.isArray(rows) && rows[0] ? rowToChatMessage(rows[0]) : null;
 }
 
 async function markMessagesReadInSupabase(senderId: 'person_1' | 'person_2', messageIds?: string[]) {
   const safeIds = Array.isArray(messageIds)
     ? messageIds.filter((id) => /^[A-Za-z0-9._:-]{1,160}$/.test(String(id))).slice(0, 200)
     : [];
-
-  if (messagesTableAvailable === false) {
-    let count = 0;
-    db.messages = (db.messages || []).map((message: any) => {
-      const idMatches = !safeIds.length || safeIds.includes(String(message.id));
-      if (message.senderId === senderId && idMatches && message.status !== 'read') {
-        count += 1;
-        return { ...message, status: 'read' };
-      }
-      return message;
-    });
-    if (count) await saveDbSync();
-    return count;
-  }
-  try {
-    const idFilter = safeIds.length
-      ? `&id=in.(${safeIds.map((id) => encodeURIComponent(String(id))).join(',')})`
-      : '';
-    const res = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?sender_id=eq.${senderId}&status=neq.read${idFilter}`,
-      {
-        method: 'PATCH',
-        headers: { Prefer: 'return=representation' },
-        body: JSON.stringify({ status: 'read' }),
-      }
-    );
-    messagesTableAvailable = true;
-    const rows = await res.json().catch(() => []);
-    return Array.isArray(rows) ? rows.length : 0;
-  } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    return markMessagesReadInSupabase(senderId, messageIds);
-  }
+  const idFilter = safeIds.length
+    ? `&id=in.(${safeIds.map((id) => encodeURIComponent(String(id))).join(',')})`
+    : '';
+  const res = await supabaseFetch(
+    `/rest/v1/${SUPABASE_MESSAGES_TABLE}?sender_id=eq.${senderId}&status=neq.read${idFilter}`,
+    {
+      method: 'PATCH',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify({ status: 'read' }),
+    },
+  );
+  const rows = await res.json().catch(() => []);
+  return Array.isArray(rows) ? rows.length : 0;
 }
 
 async function clearMessagesInSupabase(seedMessages: any[]) {
-  if (messagesTableAvailable === false) {
-    db.messages = [...seedMessages];
-    await saveDbSync();
-    return;
-  }
-  try {
-    await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=not.is.null`, {
-      method: 'DELETE',
-      headers: { Prefer: 'return=minimal' },
+  // Admin clear/seed operations target the canonical table only. Never pretend
+  // a local Worker snapshot was a successful database operation.
+  await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?id=not.is.null`, {
+    method: 'DELETE',
+    headers: { Prefer: 'return=minimal' },
+  });
+  if (seedMessages.length) {
+    await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=id`, {
+      method: 'POST',
+      headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
+      body: JSON.stringify(seedMessages.map((message) => chatMessageToRow(message))),
     });
-    messagesTableAvailable = true;
-    if (seedMessages.length) {
-      await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}`, {
-        method: 'POST',
-        headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify(seedMessages.map((message) => chatMessageToRow(message))),
-      });
-    }
-  } catch (error) {
-    if (!isMissingDataApiTableError(error)) throw error;
-    messagesTableAvailable = false;
-    db.messages = [...seedMessages];
-    await saveDbSync();
-  }
-}
-
-async function ensureMessagesTableSeed(seedMessages: any[]) {
-  if (messagesTableAvailable === false) return seedMessages;
-  try {
-    const probe = await supabaseFetch(
-      `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=id&limit=1`
-    );
-    messagesTableAvailable = true;
-    const existingRows = await probe.json().catch(() => []);
-    if (Array.isArray(existingRows) && existingRows.length > 0) {
-      return loadMessagesFromSupabase();
-    }
-    if (seedMessages.length > 0) {
-      // Worker isolates can start concurrently. Two isolates may both see an
-      // empty table and attempt to seed the same message IDs. Use PostgREST
-      // id-conflict resolution so initialization is fully idempotent.
-      await supabaseFetch(`/rest/v1/${SUPABASE_MESSAGES_TABLE}?on_conflict=id`, {
-        method: 'POST',
-        headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
-        body: JSON.stringify(seedMessages.map((message) => chatMessageToRow(message))),
-      });
-    }
-    return await loadMessagesFromSupabase();
-  } catch (error) {
-    if (isMissingDataApiTableError(error)) {
-      messagesTableAvailable = false;
-      return seedMessages;
-    }
-    throw error;
   }
 }
 
@@ -1435,33 +1315,33 @@ async function refreshDbFromSupabase(force = false) {
 
 function saveDbSync(): Promise<void> {
   const snapshot = cloneDb(db);
-  persistenceQueue = persistenceQueue
+  // Keep the queue usable after one failed write while retaining the error so
+  // callers that promise persistence can avoid returning a false success.
+  const writeAttempt = persistenceQueue
     .catch(() => undefined)
-    .then(() => persistToSupabase(snapshot))
-    .catch((err) => console.error('Failed to persist SYNAX state:', err));
+    .then(() => persistToSupabase(snapshot));
+
+  persistenceQueue = writeAttempt.then(
+    () => { lastPersistenceError = null; },
+    (err) => {
+      lastPersistenceError = err;
+      console.error('Failed to persist SYNAX state:', err);
+    },
+  );
 
   // Cloudflare may finish the HTTP response before a detached promise finishes.
   cloudflareExecutionContext?.waitUntil?.(persistenceQueue);
   return persistenceQueue;
 }
 
-// Strict variant for message fallback persistence. The regular saveDbSync keeps
-// background writes best-effort for non-critical state updates; message sends
-// must know whether their fallback snapshot was actually saved before returning
-// success to the client.
-async function saveDbSyncStrict(): Promise<void> {
-  const snapshot = cloneDb(db);
-  const previousWrite = persistenceQueue.catch(() => undefined);
-  const write = previousWrite.then(() => persistToSupabase(snapshot));
-  persistenceQueue = write.catch((err) => {
-    console.error('Failed to persist SYNAX state:', err);
-  });
-  cloudflareExecutionContext?.waitUntil?.(persistenceQueue);
-  await write;
-}
-
 async function flushPersistence() {
   await persistenceQueue;
+  if (lastPersistenceError) {
+    const detail = lastPersistenceError instanceof Error
+      ? lastPersistenceError.message
+      : String(lastPersistenceError);
+    throw new Error(`SYNAX data persistence failed: ${detail.slice(0, 600)}`);
+  }
 }
 
 function addLog(actor: string, action: string, details?: string, level: 'info' | 'warn' | 'alert' = 'info') {
@@ -1499,32 +1379,13 @@ function getOppositeUserId(userId: 'person_1' | 'person_2'): 'person_1' | 'perso
 }
 
 async function validateCallSignal(userId: 'person_1' | 'person_2', data: any, authoritativeTimeStatus?: any): Promise<string | null> {
-  const allowedTypes = new Set([
-    'call:offer', 'call:answer', 'call:ice-candidate', 'call:reject', 'call:end',
-    'call:ice-restart-offer', 'call:ice-restart-answer',
-  ]);
-  if (!data || typeof data.type !== 'string' || !allowedTypes.has(data.type)) {
+  if (!data || typeof data.type !== 'string' || !data.type.startsWith('call:')) {
     return 'Invalid call signal.';
   }
 
   if (typeof data.callId !== 'string' || data.callId.length < 8 || data.callId.length > 128) {
     return 'Invalid call id.';
   }
-
-  const cleanupSignal = data.type === 'call:end' || data.type === 'call:reject';
-  const sdpSignal = ['call:offer', 'call:answer', 'call:ice-restart-offer', 'call:ice-restart-answer'].includes(data.type);
-  if (sdpSignal && (!data.sdp || typeof data.sdp.sdp !== 'string' || data.sdp.sdp.length > 200_000)) {
-    return 'The call description is missing or too large.';
-  }
-  if (data.type === 'call:ice-candidate') {
-    if (!data.candidate || typeof data.candidate.candidate !== 'string' || data.candidate.candidate.length > 8_000) {
-      return 'Invalid ICE candidate.';
-    }
-  }
-
-  // Always permit authenticated hang-up/decline signals so a changed time limit
-  // or admin toggle cannot strand the other device in a ringing call.
-  if (cleanupSignal) return null;
 
   const callType = data.callType === 'video' ? 'video' : 'voice';
   const timeStatus = authoritativeTimeStatus || await getPersistentTimeRemaining(userId);
@@ -1621,7 +1482,13 @@ function broadcast(payload: any, _filterFn?: any) {
 // Chat sends need an acknowledgement so the sender can immediately show
 // DOUBLE TICKS when the recipient has a live authenticated WebSocket. Other
 // realtime events stay fire-and-forget so they never block the API.
-async function broadcastChatMessage(payload: any): Promise<{ recipientOnline: boolean; delivered: boolean; message?: any }> {
+async function broadcastChatMessage(payload: any): Promise<{
+  recipientOnline: boolean;
+  delivered: boolean;
+  message?: any;
+  persistedToSupabase?: boolean;
+  durability?: 'supabase' | 'durable-pending-queue';
+}> {
   const binding = cloudflareEnv?.SYNAX_REALTIME_HUB;
   if (!binding) {
     throw new Error('Cloudflare realtime Durable Object binding is unavailable.');
@@ -1645,6 +1512,8 @@ async function broadcastChatMessage(payload: any): Promise<{ recipientOnline: bo
     recipientOnline: Boolean(data?.recipientOnline),
     delivered: Boolean(data?.delivered),
     message: data?.message,
+    persistedToSupabase: typeof data?.persistedToSupabase === 'boolean' ? data.persistedToSupabase : undefined,
+    durability: data?.durability === 'supabase' || data?.durability === 'durable-pending-queue' ? data.durability : undefined,
   };
 }
 
@@ -1680,22 +1549,27 @@ async function recordCallChatEvent(params: {
   return persisted;
 }
 
-async function loadPendingMessagesFromRealtime(): Promise<any[]> {
+async function loadPendingMessagesFromRealtime(timeoutMs = 4000): Promise<any[]> {
   const binding = cloudflareEnv?.SYNAX_REALTIME_HUB;
+  // Local Node development has no Durable Object binding. In production the
+  // binding is required, and if it exists but is unreachable we must not hide
+  // that failure by claiming the pending queue is empty.
   if (!binding) return [];
-  try {
-    const id = binding.idFromName('main');
-    const stub = binding.get(id);
-    const response = await stub.fetch(new Request('https://synax.internal/pending-messages', {
-      method: 'GET',
-    }));
-    if (!response.ok) return [];
-    const data = await response.json().catch(() => ({})) as any;
-    return Array.isArray(data?.messages) ? data.messages : [];
-  } catch (error) {
-    console.warn('SYNAX pending realtime messages unavailable:', error);
-    return [];
+  const id = binding.idFromName('main');
+  const stub = binding.get(id);
+  const response = await stub.fetch(new Request('https://synax.internal/pending-messages', {
+    method: 'GET',
+    headers: { 'Cache-Control': 'no-cache' },
+    signal: AbortSignal.timeout(timeoutMs),
+  }));
+  if (!response.ok) {
+    throw new Error(`Realtime pending-message queue returned HTTP ${response.status}.`);
   }
+  const data = await response.json().catch(() => null) as any;
+  if (!data || !Array.isArray(data.messages)) {
+    throw new Error('Realtime pending-message queue returned an invalid response.');
+  }
+  return data.messages;
 }
 
 function mergePendingMessages(current: any[], pending: any[]): any[] {
@@ -1716,8 +1590,10 @@ function mergePendingMessages(current: any[], pending: any[]): any[] {
     const previousRank = statusRank[String(previous.status)] ?? 0;
     const incomingRank = statusRank[String(message.status)] ?? 0;
     byKey.set(key, {
-      ...previous,
+      // `previous` is canonical Supabase history. A queued Durable Object copy
+      // may have stale text/file metadata, so do not overwrite canonical fields.
       ...message,
+      ...previous,
       status: incomingRank >= previousRank ? message.status : previous.status,
       clientMessageId: previous.clientMessageId || message.clientMessageId,
     });
@@ -1913,8 +1789,6 @@ export async function createCloudflareHttpServer() {
       return;
     }
 
-    const turnController = new AbortController();
-    const turnTimeout = setTimeout(() => turnController.abort(), 7000);
     try {
       const response = await fetch(
         `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
@@ -1925,39 +1799,23 @@ export async function createCloudflareHttpServer() {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ ttl: 86400 }),
-          signal: turnController.signal,
         },
       );
       const data = await response.json().catch(() => ({} as any));
-      const iceServers = (Array.isArray(data?.iceServers) ? data.iceServers : [])
-        .map((server: any) => {
-          const urls = (Array.isArray(server?.urls) ? server.urls : [server?.urls])
-            .filter((url: unknown): url is string => typeof url === 'string' && Boolean(url.trim()))
-            // Cloudflare documents that port 53 can be blocked by browsers; other
-            // UDP/TCP/TLS TURN paths are retained for more reliable mobile access.
-            .filter((url: string) => !/:53(?:\?|$)/i.test(url));
-          return { ...server, urls };
-        })
-        .filter((server: any) => Array.isArray(server.urls) && server.urls.length > 0);
-      const hasRelay = iceServers.some((server: any) =>
-        server.username && server.credential && server.urls.some((url: string) => /^turns?:/i.test(url))
-      );
-      if (!response.ok || !hasRelay) {
+      if (!response.ok || !Array.isArray(data?.iceServers) || data.iceServers.length === 0) {
         throw new Error(`Cloudflare TURN credential request failed (HTTP ${response.status}).`);
       }
       res.setHeader('Cache-Control', 'private, no-store, max-age=0');
-      res.json({ iceServers, turnConfigured: true, expiresAt: Date.now() + 86400_000 });
+      res.json({ iceServers: data.iceServers, turnConfigured: true, expiresAt: Date.now() + 86400_000 });
     } catch (err) {
       console.error('SYNAX TURN credential generation failed:', err);
-      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
-      // STUN-only fallback may work on permissive networks, but cannot relay media.
+      res.setHeader('Cache-Control', 'no-store');
+      // Graceful fallback keeps calls functional on networks where direct ICE works.
       res.json({
         iceServers: FALLBACK_ICE_SERVERS,
         turnConfigured: false,
         expiresAt: Date.now() + 300_000,
       });
-    } finally {
-      clearTimeout(turnTimeout);
     }
   });
 
@@ -2436,6 +2294,59 @@ export async function createCloudflareHttpServer() {
     }
   });
 
+  // Small recovery endpoint used while the chat is open. The WebSocket remains
+  // the fast path; this only retrieves the recent window so a missed event is
+  // repaired without repeatedly downloading the entire conversation history.
+  app.get('/api/messages/recent', requireUserAuth, async (req: Request, res: Response) => {
+    const now = Date.now();
+    const requestedSince = Number(req.query.since);
+    // Keep a 15-second overlap for delayed persistence/clock skew, but bound
+    // the range so this endpoint cannot accidentally scan the full history.
+    const since = Number.isFinite(requestedSince) && requestedSince > 0
+      ? Math.max(now - 120_000, Math.min(requestedSince, now) - 15_000)
+      : now - 60_000;
+
+    const select = 'id,client_message_id,sender_id,type,text,file_url,file_name,file_size,audio_duration,timestamp,status,reactions,reply_to,is_pinned,is_edited,deleted';
+    const path = `/rest/v1/${SUPABASE_MESSAGES_TABLE}?select=${select}` +
+      `&timestamp=gte.${Math.floor(since)}&order=timestamp.asc,id.asc&limit=250`;
+
+    const [canonicalResult, pendingResult] = await Promise.allSettled([
+      supabaseFetch(path, {
+        headers: { 'Cache-Control': 'no-cache' },
+        signal: AbortSignal.timeout(3000),
+      })
+        .then(async (response) => {
+          const rows = await response.json() as SupabaseMessageRow[];
+          if (!Array.isArray(rows)) throw new Error('Supabase returned an invalid recent-message response.');
+          return rows.map(rowToChatMessage);
+        }),
+      // The Durable Object queue is the source of truth for messages that have
+      // been accepted but are still waiting for Supabase persistence. Keep this
+      // best-effort and bounded so an unhealthy realtime request never blocks
+      // already-persisted recent messages.
+      loadPendingMessagesFromRealtime(900).catch(() => []),
+    ]);
+
+    const canonical = canonicalResult.status === 'fulfilled' ? canonicalResult.value : [];
+    const pending = pendingResult.status === 'fulfilled'
+      ? pendingResult.value.filter((message: any) => Number(message?.timestamp || 0) >= since)
+      : [];
+
+    if (canonicalResult.status === 'rejected' && pending.length === 0) {
+      console.warn('SYNAX recent-message recovery failed:', canonicalResult.reason);
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.status(503).json({
+        error: 'Recent message recovery is temporarily unavailable.',
+        detail: canonicalResult.reason instanceof Error ? canonicalResult.reason.message : String(canonicalResult.reason),
+      });
+      return;
+    }
+
+    const messages = mergePendingMessages(canonical, pending);
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.json({ messages, serverTime: now });
+  });
+
   // Get messages from the canonical Supabase chat table. This avoids the
   // cross-isolate overwrite/race problems of keeping the conversation inside
   // a Cloudflare Worker global variable.
@@ -2444,10 +2355,25 @@ export async function createCloudflareHttpServer() {
       const messages = await loadMessagesFromSupabase();
       db.messages = messages;
       res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.json({ messages });
+      // Safe diagnostics help distinguish a successful empty history response
+      // from a storage failure. No keys or secrets are exposed here.
+      let supabaseProjectRef = 'unknown';
+      try { supabaseProjectRef = new URL(SUPABASE_URL).hostname.split('.')[0] || 'unknown'; } catch {}
+      res.json({
+        messages,
+        historyDiagnostics: {
+          source: `public.${SUPABASE_MESSAGES_TABLE}`,
+          count: messages.length,
+          supabaseProjectRef,
+        },
+      });
     } catch (err) {
       console.error('Failed to load messages:', err);
-      res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.status(503).json({
+        error: 'Chat storage temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -2541,91 +2467,69 @@ export async function createCloudflareHttpServer() {
       } : undefined
     };
 
-    // Persist the canonical message BEFORE acknowledging it to the sender or
-    // handing it to the realtime transport. Previously the route enqueued the
-    // message first and relied on asynchronous Durable Object persistence.
-    // If that background write failed or was delayed, the next /api/messages
-    // read came from Supabase and the just-sent bubble disappeared.
-    let persistedMessage: any;
     try {
-      persistedMessage = await insertMessageToSupabase(newMessage, validClientMessageId);
-    } catch (storageError) {
-      console.error('SYNAX message was not confirmed in canonical storage:', storageError);
-      res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.status(503).json({
-        error: 'Message storage is temporarily unavailable. Your message has not been confirmed as saved; keep it pending and retry.',
-        code: 'MESSAGE_NOT_PERSISTED',
-      });
-      return;
-    }
-
-    // Keep the isolate's cache in sync with the canonical row. Deduplicate by
-    // both server id and the stable client id so a retry cannot make a second
-    // copy or replace a newer version of the same message.
-    const persistedClientId = String(persistedMessage?.clientMessageId || validClientMessageId || '');
-    db.messages = [
-      ...(db.messages || []).filter((m: any) =>
-        String(m.id) !== String(persistedMessage.id) &&
-        (!persistedClientId || String(m.clientMessageId || '') !== persistedClientId)
-      ),
-      persistedMessage,
-    ].sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
-
-    let recipientOnline = false;
-    let delivered = false;
-
-    // Realtime is a delivery optimization after durable persistence. If the
-    // hub is unavailable, keep the saved message and make a best-effort simple
-    // broadcast; a realtime outage must never roll back or hide the message.
-    try {
+      // The API still performs authentication, expiry, and feature checks
+      // before this point. The Durable Object writes the message to its
+      // persistent pending queue first, then attempts a canonical Supabase save
+      // before acknowledging it. If Supabase is unavailable, the durable queue
+      // is retained and retried by the alarm; history merges that queue with
+      // canonical rows so a refresh does not silently drop the message.
       const delivery = await broadcastChatMessage({
         type: 'chat:enqueue_message',
-        message: persistedMessage,
+        message: newMessage,
       });
-      recipientOnline = Boolean(delivery.recipientOnline);
-      delivered = Boolean(delivery.delivered);
 
-      // Persist the delivered receipt too, so a history refresh cannot regress
-      // it to the original `sent` state. A receipt failure does not undo the
-      // already-saved message.
-      if (delivered && persistedMessage.status !== 'read' && persistedMessage.status !== 'delivered') {
-        try {
-          const updated = await updateMessageInSupabase(String(persistedMessage.id), { status: 'delivered' });
-          persistedMessage = updated || { ...persistedMessage, status: 'delivered' };
-        } catch (receiptError) {
-          console.warn('SYNAX message was saved, but delivered receipt could not be persisted:', receiptError);
-          persistedMessage = { ...persistedMessage, status: 'delivered' };
-        }
-      } else if (delivery.message && String(delivery.message.id) === String(persistedMessage.id)) {
-        // Keep server-side content canonical while accepting a monotonic receipt
-        // update from the realtime layer.
-        const statusRank: Record<string, number> = { sent: 0, delivered: 1, read: 2 };
-        const incomingStatus = String(delivery.message.status || 'sent');
-        const currentStatus = String(persistedMessage.status || 'sent');
-        if ((statusRank[incomingStatus] ?? 0) > (statusRank[currentStatus] ?? 0)) {
-          persistedMessage = { ...persistedMessage, status: incomingStatus };
-        }
+      let responseMessage = (delivery.message || newMessage) as any;
+      if (delivery.delivered && responseMessage.status !== 'read') responseMessage = { ...responseMessage, status: 'delivered' };
+
+      db.messages = [...(db.messages || []).filter((m: any) =>
+        m.id !== responseMessage.id && (!validClientMessageId || m.clientMessageId !== validClientMessageId)
+      ), responseMessage].sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
+
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.json({
+        success: true,
+        message: responseMessage,
+        delivery: {
+          recipientOnline: delivery.recipientOnline,
+          delivered: delivery.delivered,
+          persistedToSupabase: delivery.persistedToSupabase,
+          durability: delivery.durability,
+        },
+      });
+    } catch (err) {
+      console.error('Realtime enqueue failed; using durable Supabase fallback:', err);
+      // The realtime hub must never turn an otherwise-valid message into a 503.
+      // Persist the message directly, then make a best-effort realtime fan-out.
+      // The optimistic client bubble is reconciled against this canonical row.
+      try {
+        const persistedMessage = await insertMessageToSupabase(newMessage, validClientMessageId);
+        db.messages = [...(db.messages || []).filter((m: any) =>
+          m.id !== persistedMessage.id && (!validClientMessageId || m.clientMessageId !== validClientMessageId)
+        ), persistedMessage]
+          .sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
+
+        // Do not let a second realtime failure undo the successful database send.
+        // broadcast() is intentionally fire-and-forget and swallows transport errors.
+        broadcast({ type: 'chat:new_message', message: persistedMessage });
+
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        res.json({
+          success: true,
+          message: {
+            ...persistedMessage,
+            clientMessageId: persistedMessage?.clientMessageId || validClientMessageId || undefined,
+          },
+          delivery: { recipientOnline: false, delivered: false },
+        });
+      } catch (fallbackError) {
+        console.error('Failed to persist fallback message:', fallbackError);
+        res.status(503).json({
+          error: 'Message storage temporarily unavailable.',
+          detail: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+        });
       }
-    } catch (realtimeError) {
-      console.error('SYNAX realtime delivery failed after message was safely stored:', realtimeError);
-      broadcast({ type: 'chat:new_message', message: persistedMessage });
     }
-
-    // Update the cached message after any successful receipt promotion.
-    db.messages = [
-      ...(db.messages || []).filter((m: any) =>
-        String(m.id) !== String(persistedMessage.id) &&
-        (!persistedClientId || String(m.clientMessageId || '') !== persistedClientId)
-      ),
-      persistedMessage,
-    ].sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
-
-    res.setHeader('Cache-Control', 'no-store, max-age=0');
-    res.json({
-      success: true,
-      message: persistedMessage,
-      delivery: { recipientOnline, delivered },
-    });
   });
 
   // Mark partner messages as read. When messageIds are supplied, only those
@@ -2683,16 +2587,9 @@ export async function createCloudflareHttpServer() {
   app.get('/api/messages/receipts', requireUserAuth, async (req: Request, res: Response) => {
     const userId = (req as any).userId as 'person_1' | 'person_2';
     try {
-      if (messagesTableAvailable === false) {
-        const rows = (db.messages || [])
-          .filter((message: any) => message.senderId === userId)
-          .slice(-100)
-          .map((message: any) => ({ id: String(message.id), status: message.status }));
-        res.json({ receipts: rows });
-        return;
-      }
       const response = await supabaseFetch(
-        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?sender_id=eq.${userId}&select=id,status&order=timestamp.desc&limit=100`
+        `/rest/v1/${SUPABASE_MESSAGES_TABLE}?sender_id=eq.${userId}&select=id,status&order=timestamp.desc&limit=100`,
+        { headers: { 'Cache-Control': 'no-cache' } },
       );
       const rows = await response.json().catch(() => []);
       res.json({
@@ -2701,17 +2598,11 @@ export async function createCloudflareHttpServer() {
           : [],
       });
     } catch (err) {
-      if (isMissingDataApiTableError(err)) {
-        messagesTableAvailable = false;
-        const rows = (db.messages || [])
-          .filter((message: any) => message.senderId === userId)
-          .slice(-100)
-          .map((message: any) => ({ id: String(message.id), status: message.status }));
-        res.json({ receipts: rows });
-        return;
-      }
       console.error('Failed to load message receipts:', err);
-      res.status(503).json({ error: 'Chat receipt service temporarily unavailable.' });
+      res.status(503).json({
+        error: 'Chat receipt service temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -2770,8 +2661,17 @@ export async function createCloudflareHttpServer() {
         return;
       }
       const updated = await updateMessageInSupabase(id, { text, is_edited: true });
-      broadcast({ type: 'chat:message_edited', messageId: id, text, isEdited: true });
-      res.json({ success: true, message: updated || { ...msg, text, isEdited: true } });
+      const editedMessage = updated || { ...msg, text, isEdited: true };
+      broadcast({
+        type: 'chat:message_edited',
+        messageId: id,
+        clientMessageId: editedMessage.clientMessageId || msg.clientMessageId,
+        text: editedMessage.text ?? text,
+        isEdited: true,
+        message: editedMessage,
+      });
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.json({ success: true, message: editedMessage });
     } catch (err) {
       console.error('Failed to edit message:', err);
       res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
@@ -2906,11 +2806,20 @@ export async function createCloudflareHttpServer() {
     const objectPath = `chat/${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}${safeExt}`;
 
     try {
-      const supabaseHost = new URL(SUPABASE_URL).hostname;
-      const directStorageHost = supabaseHost.endsWith('.supabase.co')
-        ? `${supabaseHost.slice(0, -'.supabase.co'.length)}.storage.supabase.co`
-        : supabaseHost;
-      const uploadEndpoint = `https://${directStorageHost}/storage/v1/upload/resumable`;
+      const configuredSupabaseUrl = new URL(SUPABASE_URL);
+      const configuredHost = configuredSupabaseUrl.hostname;
+      // Supabase recommends the direct Storage hostname for TUS uploads. Keep
+      // the normal project API hostname as a fallback because some custom-domain
+      // and older deployments do not expose the direct hostname consistently.
+      const directStorageHost = configuredHost.endsWith('.storage.supabase.co')
+        ? configuredHost
+        : configuredHost.endsWith('.supabase.co')
+          ? `${configuredHost.slice(0, -'.supabase.co'.length)}.storage.supabase.co`
+          : configuredHost;
+      const uploadEndpointCandidates = Array.from(new Set([
+        `https://${directStorageHost}/storage/v1/upload/resumable`,
+        new URL('/storage/v1/upload/resumable', configuredSupabaseUrl.origin).toString(),
+      ]));
       const fileUrl = `${SUPABASE_URL}/storage/v1/object/public/synax-uploads/${objectPath.split('/').map(encodeURIComponent).join('/')}`;
       const encodeMetadata = (value: string) => Buffer.from(value, 'utf8').toString('base64');
       const metadata = [
@@ -2920,24 +2829,50 @@ export async function createCloudflareHttpServer() {
         `cacheControl ${encodeMetadata('3600')}`,
       ].join(',');
 
-      const createResponse = await fetch(uploadEndpoint, {
-        method: 'POST',
-        headers: {
-          ...getSupabaseAuthHeaders(),
-          'Tus-Resumable': '1.0.0',
-          'Upload-Length': String(declaredFileSize),
-          'Upload-Metadata': metadata,
-          'x-upsert': 'true',
-        },
-      });
-      if (!createResponse.ok) {
-        const body = await createResponse.text().catch(() => '');
-        throw new Error(`Supabase could not start the resumable upload (HTTP ${createResponse.status}). ${body.slice(0, 500)}`);
+      let uploadUrl = '';
+      const endpointFailures: string[] = [];
+      for (const uploadEndpoint of uploadEndpointCandidates) {
+        try {
+          const createResponse = await fetch(uploadEndpoint, {
+            method: 'POST',
+            headers: {
+              ...getSupabaseAuthHeaders(),
+              'Tus-Resumable': '1.0.0',
+              'Upload-Length': String(declaredFileSize),
+              'Upload-Metadata': metadata,
+              'x-upsert': 'true',
+            },
+          });
+          if (!createResponse.ok) {
+            const body = await createResponse.text().catch(() => '');
+            endpointFailures.push(`${new URL(uploadEndpoint).hostname}: HTTP ${createResponse.status} ${body.slice(0, 350)}`);
+            continue;
+          }
+          const rawLocation = createResponse.headers.get('Location');
+          if (!rawLocation) {
+            endpointFailures.push(`${new URL(uploadEndpoint).hostname}: Supabase did not return an upload Location header.`);
+            continue;
+          }
+          // Storage can return an absolute or relative Location URL. Validate it
+          // again on every follow-up request before proxying any bytes to it.
+          uploadUrl = new URL(rawLocation, uploadEndpoint).toString();
+          break;
+        } catch (endpointError) {
+          const message = endpointError instanceof Error ? endpointError.message : String(endpointError);
+          endpointFailures.push(`${new URL(uploadEndpoint).hostname}: ${message}`);
+        }
       }
-      const rawLocation = createResponse.headers.get('Location');
-      if (!rawLocation) throw new Error('Supabase did not return an upload location.');
-      // Some Storage deployments return a relative Location header.
-      const uploadUrl = new URL(rawLocation, uploadEndpoint).toString();
+      if (!uploadUrl) {
+        const failureDetail = endpointFailures.join(' | ').slice(0, 1000) || 'No Supabase upload endpoint was available.';
+        if (/maximum.*file size|file size.*(?:limit|maximum)|payload too large|entity too large|\b413\b/i.test(failureDetail)) {
+          res.status(413).json({
+            error: 'The video exceeds the maximum upload size configured for Supabase Storage. Increase the project/bucket upload limit or send a smaller video.',
+            detail: failureDetail,
+          });
+          return;
+        }
+        throw new Error(`Supabase could not start the resumable upload on either supported endpoint. ${failureDetail}`);
+      }
 
       res.setHeader('Cache-Control', 'no-store');
       res.json({
@@ -2960,11 +2895,23 @@ export async function createCloudflareHttpServer() {
   // Only Supabase's configured Storage host and resumable path are accepted.
   const validateTusUploadTarget = (rawUrl: string): URL => {
     const target = new URL(String(rawUrl || ''));
-    const configuredHost = new URL(SUPABASE_URL).hostname;
-    const allowedHost = configuredHost.endsWith('.supabase.co')
-      ? `${configuredHost.slice(0, -'.supabase.co'.length)}.storage.supabase.co`
-      : configuredHost;
-    if (target.protocol !== 'https:' || target.hostname !== allowedHost || !target.pathname.startsWith('/storage/v1/upload/resumable')) {
+    const configured = new URL(SUPABASE_URL);
+    const configuredHost = configured.hostname;
+    const directStorageHost = configuredHost.endsWith('.storage.supabase.co')
+      ? configuredHost
+      : configuredHost.endsWith('.supabase.co')
+        ? `${configuredHost.slice(0, -'.supabase.co'.length)}.storage.supabase.co`
+        : configuredHost;
+    const allowedHosts = new Set([configuredHost, directStorageHost]);
+    const allowedPath = target.pathname === '/storage/v1/upload/resumable' ||
+      target.pathname.startsWith('/storage/v1/upload/resumable/');
+    if (
+      target.protocol !== 'https:' ||
+      target.username || target.password ||
+      !allowedHosts.has(target.hostname) ||
+      (target.port && target.port !== '443') ||
+      !allowedPath
+    ) {
       throw new Error('Invalid resumable upload target.');
     }
     return target;
@@ -3092,7 +3039,7 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Update Identities & Passwords
-  app.put('/api/admin/users', requireAdminAuth, (req: Request, res: Response) => {
+  app.put('/api/admin/users', requireAdminAuth, async (req: Request, res: Response) => {
     const { person_1, person_2 } = req.body;
 
     if (person_1) {
@@ -3119,6 +3066,7 @@ export async function createCloudflareHttpServer() {
 
     saveDbSync();
     addLog('Admin', 'Updated Person Identities / Credentials', 'Names, logos or limits modified');
+    await flushPersistence();
 
     broadcast({
       type: 'identities:updated',
@@ -3138,7 +3086,7 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Lock / Unlock User
-  app.post('/api/admin/user/:id/lock', requireAdminAuth, (req: Request, res: Response) => {
+  app.post('/api/admin/user/:id/lock', requireAdminAuth, async (req: Request, res: Response) => {
     const userId = req.params.id as 'person_1' | 'person_2';
     const { isLocked, lockReason } = req.body;
 
@@ -3152,6 +3100,7 @@ export async function createCloudflareHttpServer() {
 
     saveDbSync();
     addLog('Admin', isLocked ? `Locked ${db.users[userId].name}` : `Unlocked ${db.users[userId].name}`, lockReason, isLocked ? 'alert' : 'info');
+    await flushPersistence();
 
     broadcast({
       type: 'user:lock_state',
@@ -3243,6 +3192,7 @@ export async function createCloudflareHttpServer() {
       `${action} for ${user.name}`,
       `Reset usage: ${!!resetSession}; Added: ${addMinutes || 0}m`
     );
+    await flushPersistence();
 
     // Immediately push the updated authoritative timer to connected devices.
     broadcast({
@@ -3277,8 +3227,20 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Update App & Communication Settings
-  app.put('/api/admin/settings', requireAdminAuth, (req: Request, res: Response) => {
+  app.put('/api/admin/settings', requireAdminAuth, async (req: Request, res: Response) => {
     const newSettings = req.body;
+    if (!newSettings || typeof newSettings !== 'object' || Array.isArray(newSettings)) {
+      res.status(400).json({ error: 'Invalid settings payload.' });
+      return;
+    }
+    for (const nestedKey of ['restrictionsOnExpire', 'featuresEnabled'] as const) {
+      const value = newSettings[nestedKey];
+      if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value))) {
+        res.status(400).json({ error: `Invalid ${nestedKey} settings.` });
+        return;
+      }
+    }
+
     db.settings = {
       ...db.settings,
       ...newSettings,
@@ -3294,7 +3256,9 @@ export async function createCloudflareHttpServer() {
 
     saveDbSync();
     addLog('Admin', 'Settings Updated', 'Appearance, time rules or communication features updated');
+    await flushPersistence();
 
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     broadcast({
       type: 'settings:updated',
       settings: db.settings
@@ -3307,10 +3271,14 @@ export async function createCloudflareHttpServer() {
   app.get('/api/admin/messages', requireAdminAuth, async (_req: Request, res: Response) => {
     try {
       const messages = await loadMessagesFromSupabase();
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
       res.json({ messages });
     } catch (err) {
       console.error('Failed to load admin messages:', err);
-      res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
+      res.status(503).json({
+        error: 'Chat storage temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -3346,6 +3314,7 @@ export async function createCloudflareHttpServer() {
     for (const s of currentAdminSessions) {
       try { await saveSessionToSupabase(s as any); } catch (err) { console.error('Failed to preserve admin session:', err); }
     }
+    await flushPersistence();
     broadcast({ type: 'settings:updated', settings: db.settings });
     broadcast({ type: 'identities:updated', person_1: db.users.person_1, person_2: db.users.person_2 });
     broadcast({ type: 'chat:history_cleared' });
@@ -3370,11 +3339,15 @@ export async function createCloudflareHttpServer() {
       await clearMessagesInSupabase([freshSystemMessage]);
       db.messages = [freshSystemMessage];
       addLog('Admin', 'Chat History Cleared', 'All previous messages purged');
+      await flushPersistence();
       broadcast({ type: 'chat:history_cleared' });
       res.json({ success: true });
     } catch (err) {
       console.error('Failed to clear messages:', err);
-      res.status(503).json({ error: 'Chat storage temporarily unavailable.' });
+      res.status(503).json({
+        error: 'Chat storage temporarily unavailable.',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -3384,7 +3357,7 @@ export async function createCloudflareHttpServer() {
   });
 
   // Admin: Change Administrator Password
-  app.post('/api/admin/change-password', requireAdminAuth, (req: Request, res: Response) => {
+  app.post('/api/admin/change-password', requireAdminAuth, async (req: Request, res: Response) => {
     const { currentPassword, newPassword } = req.body;
     if (!newPassword || typeof newPassword !== 'string' || newPassword.trim().length < 4) {
       res.status(400).json({ error: 'New password must be at least 4 characters long.' });
@@ -3399,6 +3372,7 @@ export async function createCloudflareHttpServer() {
     db.admin.passwordHash = bcrypt.hashSync(newPassword.trim(), 10);
     saveDbSync();
     addLog('Admin', 'Password Changed', 'Master administrator password successfully updated');
+    await flushPersistence();
     res.json({ success: true });
   });
 
