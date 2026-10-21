@@ -581,7 +581,7 @@ async function insertMessageToSupabase(message: any, clientMessageId?: string | 
     if (existing) return existing;
     const next = [...(db.messages || []), { ...message, clientMessageId: clientMessageId || message.clientMessageId }];
     db.messages = next.slice(-5000);
-    await saveDbSync();
+    await saveDbSyncStrict();
     return message;
   }
 
@@ -617,7 +617,7 @@ async function insertMessageToSupabase(message: any, clientMessageId?: string | 
     const existing = clientMessageId ? await findMessageByClientId(String(clientMessageId)) : null;
     if (existing) return existing;
     db.messages = [...(db.messages || []), { ...message, clientMessageId: clientMessageId || message.clientMessageId }].slice(-5000);
-    await saveDbSync();
+    await saveDbSyncStrict();
     return message;
   }
 }
@@ -1443,6 +1443,21 @@ function saveDbSync(): Promise<void> {
   // Cloudflare may finish the HTTP response before a detached promise finishes.
   cloudflareExecutionContext?.waitUntil?.(persistenceQueue);
   return persistenceQueue;
+}
+
+// Strict variant for message fallback persistence. The regular saveDbSync keeps
+// background writes best-effort for non-critical state updates; message sends
+// must know whether their fallback snapshot was actually saved before returning
+// success to the client.
+async function saveDbSyncStrict(): Promise<void> {
+  const snapshot = cloneDb(db);
+  const previousWrite = persistenceQueue.catch(() => undefined);
+  const write = previousWrite.then(() => persistToSupabase(snapshot));
+  persistenceQueue = write.catch((err) => {
+    console.error('Failed to persist SYNAX state:', err);
+  });
+  cloudflareExecutionContext?.waitUntil?.(persistenceQueue);
+  await write;
 }
 
 async function flushPersistence() {
@@ -2526,67 +2541,91 @@ export async function createCloudflareHttpServer() {
       } : undefined
     };
 
+    // Persist the canonical message BEFORE acknowledging it to the sender or
+    // handing it to the realtime transport. Previously the route enqueued the
+    // message first and relied on asynchronous Durable Object persistence.
+    // If that background write failed or was delayed, the next /api/messages
+    // read came from Supabase and the just-sent bubble disappeared.
+    let persistedMessage: any;
     try {
-      // The API still performs all authentication, time-limit, and feature checks
-      // before this point. After validation, hand the canonical message to the
-      // Durable Object. It writes to durable DO storage and broadcasts first,
-      // while Supabase persistence happens asynchronously with retries. This
-      // removes the Supabase round-trip from the user's send path and prevents
-      // a refresh from erasing a just-sent message.
+      persistedMessage = await insertMessageToSupabase(newMessage, validClientMessageId);
+    } catch (storageError) {
+      console.error('SYNAX message was not confirmed in canonical storage:', storageError);
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.status(503).json({
+        error: 'Message storage is temporarily unavailable. Your message has not been confirmed as saved; keep it pending and retry.',
+        code: 'MESSAGE_NOT_PERSISTED',
+      });
+      return;
+    }
+
+    // Keep the isolate's cache in sync with the canonical row. Deduplicate by
+    // both server id and the stable client id so a retry cannot make a second
+    // copy or replace a newer version of the same message.
+    const persistedClientId = String(persistedMessage?.clientMessageId || validClientMessageId || '');
+    db.messages = [
+      ...(db.messages || []).filter((m: any) =>
+        String(m.id) !== String(persistedMessage.id) &&
+        (!persistedClientId || String(m.clientMessageId || '') !== persistedClientId)
+      ),
+      persistedMessage,
+    ].sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
+
+    let recipientOnline = false;
+    let delivered = false;
+
+    // Realtime is a delivery optimization after durable persistence. If the
+    // hub is unavailable, keep the saved message and make a best-effort simple
+    // broadcast; a realtime outage must never roll back or hide the message.
+    try {
       const delivery = await broadcastChatMessage({
         type: 'chat:enqueue_message',
-        message: newMessage,
+        message: persistedMessage,
       });
+      recipientOnline = Boolean(delivery.recipientOnline);
+      delivered = Boolean(delivery.delivered);
 
-      let responseMessage = (delivery.message || newMessage) as any;
-      if (delivery.delivered && responseMessage.status !== 'read') responseMessage = { ...responseMessage, status: 'delivered' };
-
-      db.messages = [...(db.messages || []).filter((m: any) =>
-        m.id !== responseMessage.id && (!validClientMessageId || m.clientMessageId !== validClientMessageId)
-      ), responseMessage].sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
-
-      res.setHeader('Cache-Control', 'no-store, max-age=0');
-      res.json({
-        success: true,
-        message: responseMessage,
-        delivery: {
-          recipientOnline: delivery.recipientOnline,
-          delivered: delivery.delivered,
-        },
-      });
-    } catch (err) {
-      console.error('Realtime enqueue failed; using durable Supabase fallback:', err);
-      // The realtime hub must never turn an otherwise-valid message into a 503.
-      // Persist the message directly, then make a best-effort realtime fan-out.
-      // The optimistic client bubble is reconciled against this canonical row.
-      try {
-        const persistedMessage = await insertMessageToSupabase(newMessage, validClientMessageId);
-        db.messages = [...(db.messages || []).filter((m: any) =>
-          m.id !== persistedMessage.id && (!validClientMessageId || m.clientMessageId !== validClientMessageId)
-        ), persistedMessage]
-          .sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
-
-        // Do not let a second realtime failure undo the successful database send.
-        // broadcast() is intentionally fire-and-forget and swallows transport errors.
-        broadcast({ type: 'chat:new_message', message: persistedMessage });
-
-        res.setHeader('Cache-Control', 'no-store, max-age=0');
-        res.json({
-          success: true,
-          message: {
-            ...persistedMessage,
-            clientMessageId: persistedMessage?.clientMessageId || validClientMessageId || undefined,
-          },
-          delivery: { recipientOnline: false, delivered: false },
-        });
-      } catch (fallbackError) {
-        console.error('Failed to persist fallback message:', fallbackError);
-        res.status(503).json({
-          error: 'Message storage temporarily unavailable.',
-          detail: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
-        });
+      // Persist the delivered receipt too, so a history refresh cannot regress
+      // it to the original `sent` state. A receipt failure does not undo the
+      // already-saved message.
+      if (delivered && persistedMessage.status !== 'read' && persistedMessage.status !== 'delivered') {
+        try {
+          const updated = await updateMessageInSupabase(String(persistedMessage.id), { status: 'delivered' });
+          persistedMessage = updated || { ...persistedMessage, status: 'delivered' };
+        } catch (receiptError) {
+          console.warn('SYNAX message was saved, but delivered receipt could not be persisted:', receiptError);
+          persistedMessage = { ...persistedMessage, status: 'delivered' };
+        }
+      } else if (delivery.message && String(delivery.message.id) === String(persistedMessage.id)) {
+        // Keep server-side content canonical while accepting a monotonic receipt
+        // update from the realtime layer.
+        const statusRank: Record<string, number> = { sent: 0, delivered: 1, read: 2 };
+        const incomingStatus = String(delivery.message.status || 'sent');
+        const currentStatus = String(persistedMessage.status || 'sent');
+        if ((statusRank[incomingStatus] ?? 0) > (statusRank[currentStatus] ?? 0)) {
+          persistedMessage = { ...persistedMessage, status: incomingStatus };
+        }
       }
+    } catch (realtimeError) {
+      console.error('SYNAX realtime delivery failed after message was safely stored:', realtimeError);
+      broadcast({ type: 'chat:new_message', message: persistedMessage });
     }
+
+    // Update the cached message after any successful receipt promotion.
+    db.messages = [
+      ...(db.messages || []).filter((m: any) =>
+        String(m.id) !== String(persistedMessage.id) &&
+        (!persistedClientId || String(m.clientMessageId || '') !== persistedClientId)
+      ),
+      persistedMessage,
+    ].sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
+
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.json({
+      success: true,
+      message: persistedMessage,
+      delivery: { recipientOnline, delivered },
+    });
   });
 
   // Mark partner messages as read. When messageIds are supplied, only those
