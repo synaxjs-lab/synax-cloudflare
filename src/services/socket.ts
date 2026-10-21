@@ -10,6 +10,9 @@ class SocketService {
   private reconnectAttempts = 0;
   private chatActive = false;
   private heartbeatTimer: number | null = null;
+  private connectionWatchdogTimer: number | null = null;
+  private authTimeoutTimer: number | null = null;
+  private lastServerMessageAt = 0;
   private authenticated = false;
   // Preserve the latest typing state across a temporary WebSocket reconnect.
   // This prevents a user who is already typing from being invisible simply
@@ -32,6 +35,9 @@ class SocketService {
   private callSignalSince = 0;
   private visibilityHandler: (() => void) | null = null;
   private pendingCallEvents = new Map<string, any[]>();
+  // Preserve incoming chat events briefly if the socket receives one during a
+  // React transition before ChatRoom has attached its event listener.
+  private pendingChatMessages: any[] = [];
   private seenCallSignalIds = new Set<number>();
 
   connect(token: string) {
@@ -73,7 +79,6 @@ class SocketService {
     if (!this.connectivityHandler) {
       this.connectivityHandler = () => {
         if (!this.token || document.visibilityState !== 'visible') return;
-        void this.pollCallSignals();
         if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
           this.reconnectAttempts = 0;
           if (this.reconnectTimer !== null) {
@@ -106,6 +111,7 @@ class SocketService {
 
         this.ws.onopen = () => {
         this.isConnecting = false;
+        this.lastServerMessageAt = Date.now();
         this.reconnectAttempts = 0;
         if (this.reconnectTimer !== null) {
           window.clearTimeout(this.reconnectTimer);
@@ -117,14 +123,29 @@ class SocketService {
           token: this.token,
           active: document.visibilityState === 'visible',
         });
-        this.emit('connection:open', { status: 'connected' });
+        // Don't treat an open TCP/WebSocket as a healthy, authenticated chat
+        // connection. If auth stalls, close it so recovery polling can run.
+        if (this.authTimeoutTimer !== null) window.clearTimeout(this.authTimeoutTimer);
+        const openedSocket = this.ws;
+        this.authTimeoutTimer = window.setTimeout(() => {
+          if (this.ws === openedSocket && !this.authenticated) {
+            try { openedSocket?.close(4001, 'Realtime authentication timed out'); } catch {}
+          }
+        }, 7000);
+        this.emit('connection:open', { status: 'connecting' });
       };
 
       this.ws.onmessage = (event) => {
+        this.lastServerMessageAt = Date.now();
         try {
           const payload = JSON.parse(event.data);
           if (payload.type === 'auth:success') {
             this.authenticated = true;
+            this.lastServerMessageAt = Date.now();
+            if (this.authTimeoutTimer !== null) {
+              window.clearTimeout(this.authTimeoutTimer);
+              this.authTimeoutTimer = null;
+            }
             for (const resolve of this.realtimeReadyWaiters) resolve(true);
             this.realtimeReadyWaiters.clear();
             // Re-apply the desired chat-focus state after every reconnect and
@@ -134,6 +155,7 @@ class SocketService {
             this.send({ type: 'chat:active', active });
             this.startHeartbeat();
             this.send({ type: 'presence:heartbeat', active });
+            this.emit('connection:ready', { status: 'authenticated' });
             if (payload.presence) {
               this.emit('presence:update', { type: 'presence:update', presence: payload.presence });
             }
@@ -164,6 +186,10 @@ class SocketService {
 
         this.ws.onclose = () => {
         this.isConnecting = false;
+        if (this.authTimeoutTimer !== null) {
+          window.clearTimeout(this.authTimeoutTimer);
+          this.authTimeoutTimer = null;
+        }
         this.stopHeartbeat();
         this.authenticated = false;
         this.emit('connection:closed', { status: 'disconnected' });
@@ -202,12 +228,26 @@ class SocketService {
 
     beat();
     this.heartbeatTimer = window.setInterval(beat, 4_000);
+
+    // WebSockets can remain OPEN in the browser after the network path has
+    // stalled. The server directly acknowledges each heartbeat; if those
+    // acknowledgements stop, force a reconnect and let chat polling bridge it.
+    this.connectionWatchdogTimer = window.setInterval(() => {
+      if (this.ws?.readyState !== WebSocket.OPEN || !this.authenticated) return;
+      if (Date.now() - this.lastServerMessageAt > 9_000) {
+        try { this.ws.close(4000, 'Realtime heartbeat timed out'); } catch {}
+      }
+    }, 3_000);
   }
 
   private stopHeartbeat() {
     if (this.heartbeatTimer !== null) {
       window.clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+    if (this.connectionWatchdogTimer !== null) {
+      window.clearInterval(this.connectionWatchdogTimer);
+      this.connectionWatchdogTimer = null;
     }
   }
 
@@ -238,7 +278,7 @@ class SocketService {
     return Boolean(this.ws?.readyState === WebSocket.OPEN && this.authenticated);
   }
 
-  private async waitForRealtimeReady(timeoutMs = 450): Promise<boolean> {
+  private async waitForRealtimeReady(timeoutMs = 800): Promise<boolean> {
     if (this.isRealtimeReady()) return true;
     this.ensureRealtimeNow();
     if (this.isRealtimeReady()) return true;
@@ -256,10 +296,16 @@ class SocketService {
     });
   }
 
-  async sendChatMessage(message: any, timeoutMs = 1000): Promise<any | null> {
+  async sendChatMessage(message: any, timeoutMs = 2000): Promise<any | null> {
     const clientMessageId = String(message?.clientMessageId || '').trim();
     if (!clientMessageId) return null;
-    if (!(await this.waitForRealtimeReady(450))) return null;
+    // A connection can remain OPEN even when its receive path has stalled.
+    // In that case, let the idempotent HTTP fallback run instead of waiting.
+    if (this.isRealtimeReady() && Date.now() - this.lastServerMessageAt > 8_000) {
+      try { this.ws?.close(4000, 'Realtime connection stale before send'); } catch {}
+      return null;
+    }
+    if (!(await this.waitForRealtimeReady(800))) return null;
 
     const resultPromise = new Promise<any | null>((resolve) => {
       const timer = window.setTimeout(() => {
@@ -290,7 +336,7 @@ class SocketService {
   }
 
   isConnected() {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.isRealtimeReady();
   }
 
   /**
@@ -339,63 +385,44 @@ class SocketService {
 
   async sendCallSignal(payload: any): Promise<boolean> {
     const token = this.token;
-    const signalType = String(payload?.type || '');
-    const isCandidate = signalType === 'call:ice-candidate';
-    const emitSignalFailure = (error: string) => {
-      const details = { callId: payload?.callId, signalType, error, fatal: !isCandidate };
-      // A dropped trickle candidate should not end an otherwise healthy call;
-      // other candidates may still establish a route or TURN may be selected.
-      this.emit(isCandidate ? 'call:transport-warning' : 'call:error', details);
-    };
     if (!token) {
-      emitSignalFailure('Not authenticated for calls.');
+      this.emit('call:error', { error: 'Not authenticated for calls.' });
       return false;
     }
-    if (!payload?.callId || !signalType.startsWith('call:')) {
-      emitSignalFailure('Invalid call signal.');
+    if (!payload?.callId || !String(payload?.type || '').startsWith('call:')) {
+      this.emit('call:error', { error: 'Invalid call signal.' });
       return false;
     }
 
-    // Candidate insertion is safe to retry: duplicate ICE candidates are
-    // tolerated by the receiver, while retries of an offer/answer could create
-    // duplicate negotiations. Retry candidates once after transient failures.
-    const maxAttempts = isCandidate ? 2 : 1;
-    let lastError = 'Unable to reach the call signaling service. Check the connection and retry.';
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 8000);
-      try {
-        const res = await fetch('/api/call/signal', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(payload),
-          cache: 'no-store',
-          keepalive: payload.type === 'call:end' || payload.type === 'call:reject',
-          signal: controller.signal,
-        });
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 10_000);
 
-        const body = await res.json().catch(() => ({}));
-        if (res.ok) return true;
+    try {
+      const res = await fetch('/api/call/signal', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+        cache: 'no-store',
+        keepalive: payload.type === 'call:end' || payload.type === 'call:reject',
+        signal: controller.signal,
+      });
 
-        lastError = body.error || `Call signaling failed (HTTP ${res.status}).`;
-        const transientStatus = res.status === 408 || res.status === 425 || res.status === 429 || res.status >= 500;
-        if (!(isCandidate && attempt + 1 < maxAttempts && transientStatus)) break;
-      } catch (error) {
-        console.warn('SYNAX call signal request failed:', signalType, error);
-        lastError = 'Unable to reach the call signaling service. Check the connection and retry.';
-        if (!(isCandidate && attempt + 1 < maxAttempts)) break;
-      } finally {
-        window.clearTimeout(timeout);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this.emit('call:error', { error: body.error || 'Call signaling failed.' });
+        return false;
       }
-
-      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      return true;
+    } catch (error) {
+      console.error('SYNAX call signal request failed:', error);
+      this.emit('call:error', { error: 'Unable to reach the call signaling service.' });
+      return false;
+    } finally {
+      window.clearTimeout(timeout);
     }
-
-    emitSignalFailure(lastError);
-    return false;
   }
 
   async getCallOffer(callId: string): Promise<any | null> {
@@ -403,7 +430,7 @@ class SocketService {
     if (!token || !callId) return null;
 
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 2500);
+    const timeout = window.setTimeout(() => controller.abort(), 6000);
 
     try {
       const url = `/api/call/signals?callId=${encodeURIComponent(callId)}&since=${encodeURIComponent(Date.now() - 120_000)}`;
@@ -436,21 +463,18 @@ class SocketService {
     void this.pollCallSignals();
     this.callPollTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void this.pollCallSignals();
-    }, 1000);
+    }, 2000);
   }
 
   private async pollCallSignals() {
     if (this.callPollInFlight || !this.token || document.visibilityState !== 'visible') return;
     this.callPollInFlight = true;
 
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 6000);
     try {
       const url = `/api/call/signals?after=${encodeURIComponent(this.callSignalAfterId)}&since=${encodeURIComponent(this.callSignalSince)}`;
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${this.token}` },
         cache: 'no-store',
-        signal: controller.signal,
       });
 
       if (!res.ok) return;
@@ -485,7 +509,6 @@ class SocketService {
       // Call transport errors must never interrupt the rest of SYNAX.
       console.warn('SYNAX call polling failed:', error);
     } finally {
-      window.clearTimeout(timeout);
       this.callPollInFlight = false;
     }
   }
@@ -508,6 +531,13 @@ class SocketService {
 
     if (event === 'presence:update' && this.lastPresenceEvent) {
       try { callback(this.lastPresenceEvent); } catch (error) { console.error(error); }
+    }
+
+    if (event === 'chat:new_message' && this.pendingChatMessages.length) {
+      const pending = this.pendingChatMessages.splice(0, this.pendingChatMessages.length);
+      for (const payload of pending) {
+        try { callback(payload); } catch (error) { console.error('SYNAX buffered chat message listener error:', error); }
+      }
     }
 
     if (event.startsWith('call:')) {
@@ -540,6 +570,15 @@ class SocketService {
       return;
     }
 
+    if (event === 'chat:new_message' && data?.message) {
+      // Store only events that arrived while no chat listener existed. Normal
+      // events are dispatched once and aren't replayed to active listeners.
+      this.pendingChatMessages.push(data);
+      if (this.pendingChatMessages.length > 100) {
+        this.pendingChatMessages.splice(0, this.pendingChatMessages.length - 100);
+      }
+    }
+
     if (event.startsWith('call:')) {
       const pending = this.pendingCallEvents.get(event) || [];
       pending.push(data);
@@ -555,7 +594,12 @@ class SocketService {
     }
     this.stopCallPolling();
     this.stopHeartbeat();
+    if (this.authTimeoutTimer !== null) {
+      window.clearTimeout(this.authTimeoutTimer);
+      this.authTimeoutTimer = null;
+    }
     this.pendingCallEvents.clear();
+    this.pendingChatMessages = [];
     this.seenCallSignalIds.clear();
     this.token = null;
     this.authenticated = false;
