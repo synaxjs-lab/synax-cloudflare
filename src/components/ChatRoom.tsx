@@ -902,6 +902,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     let retryTimer: number | null = null;
     let retryDelayMs = 1000;
     let consecutiveRecentFailures = 0;
+    // If the lightweight recovery endpoint is missing or temporarily failing
+    // in the deployed Worker, fall back to the known-good full history endpoint
+    // at a bounded cadence. This prevents an OPEN-but-broken WebSocket and a
+    // failed recent endpoint from leaving the recipient waiting until refresh.
+    let lastFullHistoryFallbackAt = 0;
 
     const scheduleHistoryRetry = () => {
       if (stopped || retryTimer !== null || document.visibilityState !== 'visible') return;
@@ -981,6 +986,16 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         // still making repeated failures visible for diagnosis.
         if (consecutiveRecentFailures === 1 || consecutiveRecentFailures % 5 === 0) {
           console.warn('SYNAX live message recovery is temporarily unavailable:', err);
+        }
+
+        // Crucial fallback: visible history can still be loaded through
+        // /api/messages even if /api/messages/recent is not available in the
+        // currently deployed API. Run it at most every 5 seconds, never once
+        // per failed 2-second poll, and preserve existing bubbles on failures.
+        const now = Date.now();
+        if (!historyInFlight && now - lastFullHistoryFallbackAt >= 5_000) {
+          lastFullHistoryFallbackAt = now;
+          void refreshFullHistory();
         }
       } finally {
         recentInFlight = false;
